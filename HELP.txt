@@ -1,425 +1,429 @@
 ================================================================================
-                    NetScan - консольный сканер локальной сети
-                              для Windows Vista - 11
+                  NetScan - a console local network scanner
+                            for Windows Vista - 11
 ================================================================================
 
 
-ЧТО ЭТО
+WHAT THIS IS
 ================================================================================
 
-NetScan - лёгкий консольный TCP/UDP сканер локальной сети для Windows,
-написанный на C и скомпилированный кросс-компилятором mingw-w64 (собирается
-из Linux, статическая линковка - никаких дополнительных DLL на целевой
-машине не требуется). Работает на x86 (32-бит) и x64 (64-бит), от Windows
-Vista до Windows 11 включительно.
+NetScan is a lightweight console TCP/UDP local network scanner for Windows,
+written in C and built with the mingw-w64 cross-compiler (compiled on Linux,
+statically linked - no extra DLLs are needed on the target machine). Ships
+as separate x86 (32-bit) and x64 (64-bit) builds, and runs on anything from
+Windows Vista through Windows 11.
 
-Придуман как замена nmap для повседневных задач системного администратора,
-когда нужен быстрый, лёгкий инструмент с наглядным прогресс-баром, который
-не только находит открытые порты, но и по возможности сразу же отвечает
-на вопрос "а что это вообще за устройство и как его зовут" - без установки
-Npcap/WinPcap и без прав администратора.
+It was built as a replacement for nmap for everyday sysadmin tasks, for
+situations where you want a fast, lightweight tool with a real progress
+bar that not only finds open ports but, where possible, immediately
+answers "what kind of device is this and what's it called" - without
+installing Npcap/WinPcap and without administrator rights.
 
-Ключевые принципы:
-  - Никаких сторонних драйверов (Npcap/WinPcap) - работает "из коробки".
-  - Не требует прав администратора для базового сканирования.
-  - Честный прогресс-бар и статистика в реальном времени.
-  - Реальный асинхронный "fast"-режим (сотни/тысячи проверок одновременно
-    на поток), а не имитация через много ОС-потоков.
-  - Стоимость доп. диагностики (MAC/имя устройства/ОС) считается на ХОСТ,
-    а не на ПОРТ - не замедляет сам скан портов.
+Core principles:
+  - No third-party drivers (Npcap/WinPcap) - works out of the box.
+  - No administrator rights required for basic scanning.
+  - An honest, real-time progress bar and stats.
+  - A genuinely asynchronous "fast" mode (hundreds/thousands of concurrent
+    checks per thread), not an illusion created by spawning many OS threads.
+  - The cost of extra diagnostics (MAC / device name / OS) is charged PER
+    HOST, not per port - it doesn't slow down the port scan itself.
 
 
-СИНТАКСИС
+SYNTAX
 ================================================================================
 
-netscan_x64.exe --ip <диапазон> --ports <список> --proto all|tcp|udp
-                 --threads <N> --mode full|fast [доп. параметры]
+netscan_x64.exe --ip <range> --ports <list> --proto all|tcp|udp
+                 --threads <N> --mode full|fast [extra options]
 
-Обязательные параметры: --ip, --ports
-Всё остальное имеет разумные значения по умолчанию.
+Required: --ip, --ports
+Everything else has sensible defaults.
 
 
-ПРИМЕРЫ ЗАПУСКА
+USAGE EXAMPLES
 ================================================================================
 
-1) Простейший скан одного хоста по паре портов (полный, надёжный режим):
+1) Simplest scan of a single host on a couple of ports (full, reliable mode):
 
    netscan_x64.exe --ip 192.168.1.1 --ports 22,80,443 --proto tcp
                    --threads 20 --mode full
 
-   Медленно, но максимально надёжно - один запрос на порт за раз на поток.
+   Slow, but maximally reliable - one request per port at a time per thread.
 
 
-2) Быстрый скан всей домашней подсети по популярным портам:
+2) Fast scan of an entire home subnet on common ports:
 
    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 21,22,23,25,53,
                    80,110,143,443,445,3389,5900-5910 --proto all
                    --mode fast --threads 50 --batch 32 --discover
 
-   --discover резко ускоряет скан больших диапазонов: сначала быстрый
-   ICMP+ARP пинг находит РЕАЛЬНО живые хосты, и только по ним потом
-   гоняются порты - вместо того чтобы ждать таймаут на каждый порт
-   каждого из 254 адресов, даже если там никого нет.
+   --discover dramatically speeds up scans of large ranges: a fast
+   ICMP+ARP sweep first finds which hosts are ACTUALLY alive, and only
+   those get their ports scanned - instead of waiting out a full timeout
+   on every port of every one of 254 addresses, even the ones with
+   nothing listening.
 
 
-3) Полная диагностика найденных устройств (имя, MAC, вендор, ОС, тип):
+3) Full diagnostics on every device found (name, MAC, vendor, OS, type):
 
    netscan_x64.exe --ip 192.168.0.1-192.168.0.255 --ports 53,80,443,445,
                    161,5900-5910 --proto all --discover --info
                    --mode fast --threads 50 --batch 32
                    --out result.txt
 
-   Добавляет для каждого найденного хоста: MAC-адрес и вендора (по базе
-   OUI), грубую эвристику ОС по TTL, тип устройства по набору открытых
-   портов (принтер/камера/Android/Windows и т.п.), NetBIOS имя/домен,
-   mDNS-имя, LLMNR-имя компьютера, SNMP sysDescr.
+   Adds, for every host found: MAC address and vendor (from an OUI
+   database), a rough OS guess from TTL, device type inferred from the
+   set of open ports (printer/camera/Android/Windows/etc.), NetBIOS
+   name/domain, mDNS name, LLMNR computer name, SNMP sysDescr.
 
 
-4) Максимально дотошное определение имени компьютера, включая AD-домен:
+4) Maximally thorough hostname resolution, including the AD domain:
 
    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 445
                    --proto tcp --discover --info --deep-resolve
                    --dns-server 192.168.1.1 --mode full --threads 30
 
-   --deep-resolve добавляет ещё два способа определения имени:
-   обратный DNS (PTR) через указанный DNS-сервер (или через
-   автоопределённый шлюз, если --dns-server не указан) и SMB2/NTLMSSP
-   хендшейк по TCP 445 - самый надёжный источник, отдаёт NetBIOS-имя,
-   NetBIOS-домен, DNS-имя компьютера и DNS-домен разом, без единой
-   попытки авторизации. Работает одинаково в рабочей группе и в AD.
+   --deep-resolve adds two more ways to resolve a hostname: reverse DNS
+   (PTR) through the given DNS server (or an auto-detected gateway if
+   --dns-server is omitted), and an SMB2/NTLMSSP handshake over TCP 445 -
+   the most reliable source of all, returning the NetBIOS name, NetBIOS
+   domain, DNS computer name and DNS domain all at once, without a
+   single authentication attempt. Works the same way in a workgroup and
+   in an AD domain.
 
 
-5) Только UDP, только DNS/NTP/SNMP - проверка сетевых служб роутера:
+5) UDP only, DNS/NTP/SNMP only - checking a router's network services:
 
    netscan_x64.exe --ip 192.168.1.1 --ports 53,123,161 --proto udp
                    --mode full --threads 5 --timeout 1500
 
-   Для этих портов сканер шлёт не пустой "пробник", а настоящие
-   протокольные запросы (валидный DNS A-запрос, NTP client request,
-   SNMP GetRequest community "public") - иначе большинство служб просто
-   молча проигнорируют мусорный пакет и порт покажется закрытым, хотя
-   служба реально работает.
+   For these ports the scanner sends real protocol requests instead of
+   an empty "probe" (a valid DNS A-record query, an NTP client request,
+   an SNMP GetRequest with community "public") - otherwise most services
+   would simply, silently ignore a garbage packet and the port would
+   look closed even though the service is actually running.
 
 
-6) Журнал повторяющихся сканирований одного диапазона с метками времени:
+6) A log of repeated scans of the same range, with timestamps:
 
    netscan_x64.exe --ip 192.168.1.1-192.168.1.50 --ports 22,80,443
                    --proto tcp --mode full --threads 20
                    --out monitoring.txt --resume --when
 
-   Каждый новый запуск ДОПИСЫВАЕТ результат в конец файла (не
-   перезаписывает), отделяя сканирования двумя пустыми строками, и
-   ставит метку времени "07:15:00  12.07.2026" перед каждым блоком.
-   Удобно гонять по расписанию (планировщик задач Windows) и потом
-   смотреть один растущий файл-журнал.
+   Every run APPENDS to the end of the file (instead of overwriting it),
+   separating scans with two blank lines, and stamps a timestamp
+   "07:15:00  12.07.2026" before each block. Handy for running on a
+   schedule (Windows Task Scheduler) and reviewing one growing log file
+   afterwards.
 
 
-7) Устойчивый скан через слабый/перегруженный роутер:
+7) A resilient scan through a weak/overloaded router:
 
    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 80,443,445
                    --proto all --mode fast --threads 30 --batch 16
                    --retries 3 --timeout 1000
 
-   --retries N повторяет проверку порта до N раз, если ответа не было
-   (не в ущерб скорости остальных - в fast-режиме повтор идёт для
-   конкретного слота, не блокируя остальные параллельные проверки).
+   --retries N retries a port check up to N times if there was no
+   response (without slowing down the other checks - in fast mode a
+   retry only re-arms that one slot, without blocking the other parallel
+   checks).
 
 
-8) Обход зарезервированных адресов диапазона отключен намеренно:
+8) Reserved addresses in the range are intentionally skipped by default:
 
    netscan_x64.exe --ip 192.168.1.0-192.168.1.255 --ports 80
                    --proto tcp --mode full --threads 10
                    --include-reserved
 
-   По умолчанию сканер пропускает x.x.x.0 и x.x.x.255 (это сетевой и
-   широковещательный адрес обычной /24-сети, а не отдельные хосты -
-   опрос broadcast-адреса даёт ложные результаты, отвечает случайный
-   сосед по подсети). --include-reserved включает их обратно, если
-   у вас нестандартная маска подсети и они реально нужны.
+   By default the scanner skips x.x.x.0 and x.x.x.255 (the network and
+   broadcast address of a normal /24 network, not individual hosts -
+   probing a broadcast address gives misleading results, since some
+   random neighbor on the subnet ends up answering for it).
+   --include-reserved turns them back on, for the rare case of a
+   non-standard subnet mask where they really are usable hosts.
 
 
-9) Оба варианта сортировки результата одновременно:
+9) Both sort orders for the results, at the same time:
 
    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 22,80,443,3389
                    --proto tcp --discover --mode fast --threads 50
                    --out result.txt --sort-by-port
 
-   Создаёт ДВА файла: result.txt (отсортирован по IP, как обычно) и
-   result_by_port.txt (та же информация, но сгруппирована по портам -
-   удобно смотреть "у кого вообще открыт 3389", а не "что открыто у
-   каждого хоста").
+   Produces TWO files: result.txt (sorted by IP, as usual) and
+   result_by_port.txt (the same data, but grouped by port - handy for
+   answering "who has 3389 open" rather than "what's open on this host").
 
 
-10) Обновление базы вендоров MAC-адресов перед выездом на объект без
-    интернета:
+10) Updating the MAC vendor database before heading to a site with no
+    internet access:
 
     netscan_x64.exe --update-oui
 
-    Скачивает актуальную базу OUI (IEEE, через репозиторий nmap) в
-    oui.txt рядом с exe-файлом. Если файла нет вообще - вендор по MAC
-    просто не будет определяться, скан при этом продолжит работать
-    нормально. Файл можно скопировать вручную на изолированную машину.
+    Downloads a current OUI database (IEEE data, via the nmap
+    repository) into oui.txt next to the exe. If the file is missing,
+    vendor lookup by MAC simply won't happen and the scan will otherwise
+    work normally. The file can be copied by hand onto an isolated
+    machine.
 
 
-ПОЛНЫЙ ФУНКЦИОНАЛ И ВОЗМОЖНОСТИ
+FULL FEATURE REFERENCE
 ================================================================================
 
 --------------------------------------------------------------------------
-1. АДРЕСА И ПОРТЫ
+1. ADDRESSES AND PORTS
 --------------------------------------------------------------------------
 
---ip <спец>
-    Диапазон(ы) IPv4-адресов. Форматы (можно смешивать через запятую):
-      - Одиночный IP:              192.168.1.5
-      - Диапазон "от-до":          192.168.1.1-192.168.1.254
-      - Несколько диапазонов:      192.168.1.1-192.168.1.254,10.0.0.1-10.0.0.50
-    Также поддерживается перенос строки как разделитель между диапазонами.
-    x.x.x.0 и x.x.x.255 внутри диапазона пропускаются автоматически (см.
-    --include-reserved ниже) - это сетевой и broadcast-адрес обычной /24
-    сети, а не реальные хосты.
+--ip <spec>
+    One or more IPv4 ranges. Formats (can be mixed, comma-separated):
+      - A single IP:                192.168.1.5
+      - A "from-to" range:          192.168.1.1-192.168.1.254
+      - Multiple ranges:            192.168.1.1-192.168.1.254,10.0.0.1-10.0.0.50
+    A newline is also accepted as a separator between ranges.
+    x.x.x.0 and x.x.x.255 inside a range are skipped automatically (see
+    --include-reserved below) - these are the network and broadcast
+    address of a normal /24 network, not real hosts.
 
---ports <спец>
-    Список портов через запятую, с поддержкой диапазонов:
+--ports <spec>
+    A comma-separated port list, with range support:
       80,443,1000-1200,500,445,53
-    Дубликаты в списке автоматически схлопываются - можно не бояться
-    случайно указать один порт дважды, лишний раз он не просканируется
-    и не появится дважды в результате.
+    Duplicates in the list are automatically collapsed - no need to
+    worry about accidentally listing a port twice, it won't be scanned
+    twice and won't show up twice in the results.
 
 --proto all|tcp|udp
-    Какие протоколы сканировать. При "all" TCP и UDP по умолчанию
-    сканируются ОДНОВРЕМЕННО (в двух независимых наборах потоков), а не
-    последовательно - это примерно вдвое быстрее. Каждый протокол
-    рисует свой прогресс-бар на отдельной закреплённой строке консоли
-    (работает только в настоящем окне cmd.exe, не при перенаправлении
-    в файл/pipe). Принудительно вернуть последовательный порядок - см.
-    --sequential.
+    Which protocols to scan. With "all", TCP and UDP are scanned AT THE
+    SAME TIME by default (in two independent sets of threads), not
+    sequentially - roughly twice as fast. Each protocol draws its own
+    progress bar on its own fixed console line (only works in a real
+    cmd.exe window, not when output is redirected to a file/pipe). To
+    force the old sequential order, see --sequential.
 
 --include-reserved
-    Не пропускать x.x.x.0 и x.x.x.255 - сканировать их как обычные
-    хосты. Нужно только при нестандартной маске подсети, где эти адреса
-    реально являются рабочими хостами.
+    Do not skip x.x.x.0 and x.x.x.255 - scan them like ordinary hosts.
+    Only needed with a non-standard subnet mask where these addresses
+    are genuinely working hosts.
 
 --------------------------------------------------------------------------
-2. РЕЖИМЫ СКАНИРОВАНИЯ
+2. SCAN MODES
 --------------------------------------------------------------------------
 
 --mode full|fast
-    full - надёжный, "по одному за раз на поток" режим. Каждый поток
-        обрабатывает одну проверку порта полностью (включая ожидание
-        таймаута), потом берёт следующую задачу из очереди. Параллельность
-        строго равна числу потоков (--threads).
+    full - the reliable "one at a time per thread" mode. Each thread
+        handles one port check fully (including waiting out the
+        timeout), then takes the next task off the queue. Concurrency
+        is exactly the thread count (--threads).
 
-    fast - настоящий асинхронный режим. Каждый поток держит открытыми
-        сразу --batch соединений одновременно ("выстрелил - не жду -
-        проверяю следующее - готов ответ пришёл - зафиксировал"), через
-        select() узнавая, какие из них уже готовы, не дожидаясь остальных
-        по очереди. Реальная параллельность = --threads x --batch.
-        На несуществующих хостах (нет ARP-ответа) даёт прирост скорости
-        на порядки по сравнению с full-режимом при том же числе потоков.
+    fast - a genuinely asynchronous mode. Each thread keeps --batch
+        connections open at once ("fire - don't wait - check the next
+        one - a reply came in - record it"), using select() to find out
+        which ones are ready without waiting for the rest in turn.
+        Real concurrency = --threads x --batch. On non-existent hosts
+        (no ARP reply) this gives an order-of-magnitude speedup compared
+        to full mode with the same thread count.
 
 --threads N
-    Число используемых ОС-потоков. В full-режиме - это и есть реальная
-    параллельность. В fast-режиме - множитель для --batch (см. выше).
-    Разумные значения: 20-100 для full, 30-100 для fast. Внутренний
-    потолок - 512 потоков (у каждого ОС-потока свой стек, не стоит
-    бездумно наращивать).
+    Number of OS threads used. In full mode this is the actual
+    concurrency. In fast mode it's a multiplier for --batch (see
+    above). Sensible values: 20-100 for full, 30-100 for fast. Internal
+    cap: 512 threads (each OS thread has its own stack, no point in
+    scaling this blindly).
 
---batch N (по умолчанию 32, работает только в --mode fast)
-    Сколько соединений один поток держит открытыми одновременно. Пример:
-    50 потоков x 32 batch = 1600 одновременных проверок.
+--batch N (default 32, only applies to --mode fast)
+    How many connections a single thread keeps open at once. Example:
+    50 threads x 32 batch = 1600 concurrent checks.
 
---timeout N (миллисекунды, по умолчанию 800)
-    Сколько ждать ответа на один запрос перед тем как считать порт
-    закрытым/недоступным.
+--timeout N (milliseconds, default 800)
+    How long to wait for a reply to a single request before considering
+    the port closed/unreachable.
 
---retries N (по умолчанию 1)
-    Сколько раз повторять проверку порта, если ответа не было - полезно
-    при потере пакетов на слабом/перегруженном маршрутизаторе. Работает
-    и в full, и в fast режиме (в fast - повтор идёт для конкретного
-    "слота", не блокируя остальные параллельные проверки).
+--retries N (default 1)
+    How many times to retry a port check if there was no reply - useful
+    against packet loss on a weak/overloaded router. Works in both full
+    and fast mode (in fast mode, a retry only re-arms that one "slot",
+    without blocking the other parallel checks).
 
 --sequential
-    Принудительно сканировать TCP и UDP по очереди вместо одновременно
-    (актуально только при --proto all).
+    Force TCP and UDP to be scanned one after another instead of at the
+    same time (only relevant with --proto all).
 
 --------------------------------------------------------------------------
-3. ПРОТОКОЛ-СПЕЦИФИЧНЫЕ UDP-ПРОБНИКИ
+3. PROTOCOL-SPECIFIC UDP PROBES
 --------------------------------------------------------------------------
 
-UDP - протокол без хендшейка: пустой "пробник" многие службы просто
-молча игнорируют, если не могут распознать его как валидный запрос
-(классический пример - DNS: TCP:53 находится от одного факта хендшейка,
-а UDP:53 с пустым пакетом - нет, хотя служба работает). Поэтому для
-следующих портов сканер отправляет НАСТОЯЩИЕ протокольные запросы вместо
-пустого байта:
+UDP is connectionless - many services simply, silently ignore an empty
+"probe" if they can't recognize it as a valid request (the classic
+example is DNS: TCP:53 gets found from the mere fact of a TCP handshake,
+while UDP:53 with an empty packet doesn't, even though the service is
+running). So for the following ports the scanner sends REAL protocol
+requests instead of a single empty byte:
 
-  - 53  (DNS)  - валидный A-запрос домена example.com
-  - 123 (NTP)  - стандартный клиентский запрос (client mode 3)
-  - 161 (SNMP) - GetRequest (SNMPv1, community "public") на sysDescr.0
+  - 53  (DNS)  - a valid A-record query for example.com
+  - 123 (NTP)  - a standard client request (client mode 3)
+  - 161 (SNMP) - a GetRequest (SNMPv1, community "public") for sysDescr.0
 
-Для всех остальных UDP-портов используется обычный минимальный пробник.
+All other UDP ports use the regular minimal probe.
 
 --------------------------------------------------------------------------
-4. РАЗВЕДКА ЖИВЫХ ХОСТОВ: --discover
+4. LIVE-HOST DISCOVERY: --discover
 --------------------------------------------------------------------------
 
 --discover
-    Перед сканированием портов сначала быстро проверяет, какие хосты в
-    диапазоне вообще существуют - ДВУМЯ независимыми способами разом:
+    Before scanning ports, quickly checks which hosts in the range
+    actually exist - using TWO independent methods at once:
 
-      1. ICMP-пинг (через штатный Windows API IcmpSendEcho, БЕЗ прав
-         администратора и без raw-сокетов).
-      2. ARP-запрос (SendARP) - для хостов в ВАШЕЙ ЖЕ локальной подсети.
-         ARP работает на канальном уровне и не обходится настройками
-         "ICMP выключен на этом устройстве" - если пинг молчит, а
-         устройство физически в сети, ARP всё равно его найдёт.
+      1. ICMP ping (via the standard Windows API IcmpSendEcho, WITHOUT
+         administrator rights and without raw sockets).
+      2. ARP request (SendARP) - for hosts on YOUR OWN local subnet.
+         ARP operates at the link layer and isn't affected by "ICMP is
+         disabled on this device" settings - if ping stays silent but
+         the device is physically on the network, ARP will still find it.
 
-    Хост считается живым, если ответил хотя бы один из двух способов.
-    Порты сканируются только по хостам, прошедшим эту проверку - для
-    больших диапазонов (например /24) это ускоряет скан на порядки,
-    потому что не тратится время на полный таймаут по каждому порту
-    для каждого из сотен несуществующих адресов.
+    A host is considered alive if either method gets a response. Ports
+    are then only scanned on hosts that passed this check - for large
+    ranges (e.g. a /24) this speeds things up by orders of magnitude,
+    because time isn't wasted waiting out a full timeout on every port
+    of every one of hundreds of non-existent addresses.
 
-    ВАЖНО: --discover полностью исключает из результата любой хост,
-    который не ответил НИ на пинг, НИ на ARP - даже если у него открыт
-    порт. Для устройств с жёстко настроенным файрволом, который режет
-    и ICMP тоже, это может дать "слепую зону". Для параноидальной
-    перепроверки прогоните диапазон ещё раз без --discover.
+    IMPORTANT: --discover completely excludes from the results any host
+    that answered NEITHER ping NOR ARP - even if it has an open port.
+    For a device with a firewall configured to also block ICMP, this
+    can create a blind spot. For a paranoid re-check, run the range
+    again without --discover.
 
---ping-timeout N (миллисекунды, по умолчанию 500)
-    Таймаут именно для фазы разведки (--discover), отдельно от --timeout
-    для самого скана портов.
+--ping-timeout N (milliseconds, default 500)
+    Timeout used specifically for the discovery phase (--discover),
+    separate from --timeout used for the port scan itself.
 
 --------------------------------------------------------------------------
-5. ДИАГНОСТИКА УСТРОЙСТВ: --info
+5. DEVICE DIAGNOSTICS: --info
 --------------------------------------------------------------------------
 
 --info
-    После скана портов собирает дополнительную информацию по каждому
-    "интересному" хосту - ОДИН РАЗ НА ХОСТ, не на порт, поэтому не
-    замедляет сам скан портов. Список хостов для диагностики:
-      - если использовался --discover - все хосты, ответившие на
-        пинг/ARP;
-      - если --discover не использовался - только хосты, на которых
-        реально нашёлся хотя бы один открытый TCP/UDP порт.
+    After the port scan, gathers additional information for every
+    "interesting" host - ONCE PER HOST, not per port, so it doesn't slow
+    down the port scan itself. The host list used for diagnostics:
+      - if --discover was used - every host that answered ping/ARP;
+      - if --discover was not used - only hosts where at least one open
+        TCP/UDP port was actually found.
 
-    Источники информации (все - широковещательные/протокольные запросы,
-    не требуют паролей и прав администратора):
+    Information sources (all broadcast/protocol-level requests, none of
+    them require a password or administrator rights):
 
-    MAC-адрес и вендор
-        Через SendARP (для хостов в вашей локальной подсети - для
-        адресов за её пределами MAC намеренно не показывается, чтобы
-        не выдавать MAC пограничного маршрутизатора за реальный ответ
-        удалённого хоста). Вендор определяется по базе OUI (см. ниже,
-        --update-oui) - если базы нет рядом с exe, показывается только
-        сам MAC без расшифровки вендора.
+    MAC address and vendor
+        Via SendARP (for hosts on your local subnet - for addresses
+        outside it, the MAC is deliberately not shown, so as not to pass
+        off the border router's MAC as a real answer from the remote
+        host). The vendor is looked up in an OUI database (see
+        --update-oui below) - if the database isn't present, only the
+        raw MAC is shown without a vendor name.
 
-    TTL и грубая эвристика ОС
-        TTL берётся из ICMP-ответа (бесплатно, если уже использовался
-        --discover). Округление до ближайшего стандартного стартового
-        значения: TTL<=64 - Linux/Android/embedded, TTL<=128 - Windows,
-        TTL<=255 - сетевое оборудование/иное. Точность условная (TTL
-        можно подделать вручную), но как быстрый ориентир - рабочий
-        метод.
+    TTL and a rough OS guess
+        TTL comes from the ICMP reply (free if --discover was already
+        used). Rounded to the nearest standard starting value:
+        TTL<=64 - Linux/Android/embedded, TTL<=128 - Windows,
+        TTL<=255 - network equipment/other. The accuracy is only
+        approximate (TTL can be spoofed manually), but as a quick
+        pointer it works well.
 
-    Тип устройства по набору открытых портов
-        Чистый offline-анализ уже собранных результатов, без
-        дополнительных сетевых запросов: 515/631/9100 -> принтер,
-        554 -> IP-камера/медиа, 5555 -> Android (ADB), 62078 ->
-        iOS-устройство, 3389 -> Windows (RDP), 445+139 -> Windows/Samba,
-        1900/8008/8009 -> медиа-устройство (UPnP/Cast), 22 без 445 ->
-        Linux/сетевое устройство.
+    Device type from the set of open ports
+        A pure offline analysis of already-collected results, with no
+        extra network requests: 515/631/9100 -> printer, 554 -> IP
+        camera/media, 5555 -> Android (ADB), 62078 -> iOS device,
+        3389 -> Windows (RDP), 445+139 -> Windows/Samba,
+        1900/8008/8009 -> media device (UPnP/Cast), 22 without 445 ->
+        Linux/network device.
 
     NetBIOS (NBSTAT, UDP 137)
-        Один запрос "*" отдаёт NetBIOS-имя компьютера и рабочую
-        группу/домен.
+        A single "*" query returns the computer's NetBIOS name and its
+        workgroup/domain.
 
     mDNS (UDP 5353)
-        Запрос списка сервисов ("_services._dns-sd._udp.local"). Без
-        полного разбора DNS-сжатия - вытаскивается самая длинная
-        печатаемая ASCII-подстрока из ответа (обычно это и есть имя
-        хоста или тип сервиса). Лучше всего работает для Android,
-        принтеров, умных устройств, Linux.
+        A service-list query ("_services._dns-sd._udp.local"). Without
+        a full DNS-compression parser - the longest printable ASCII
+        substring is extracted from the reply (usually the hostname or
+        service type). Works best for Android, printers, smart devices,
+        and Linux.
 
-    LLMNR (UDP 5355) - имя компьютера Windows
-        Современная замена NetBIOS, которую Windows держит включённой
-        по умолчанию даже когда "NetBIOS over TCP/IP" отключён вручную.
-        Запрашивается PTR-запись обратного адреса, респондер отвечает
-        собственным именем компьютера. Пакет отправляется с IP TTL=255
-        (это обязательное по RFC 4795 требование - респондер молча
-        отбрасывает запросы с иным TTL).
+    LLMNR (UDP 5355) - Windows computer name
+        A modern replacement for NetBIOS that Windows keeps enabled by
+        default even when "NetBIOS over TCP/IP" has been manually
+        disabled. A reverse-address PTR record is requested; the
+        responder replies with its own computer name. The packet is
+        sent with IP TTL=255 (mandatory per RFC 4795 - a responder must
+        silently discard requests with any other TTL).
 
     SNMP sysDescr
-        Если порт 161 входит в список сканируемых портов - переиспользует
-        уже отправленный туда запрос и парсит текстовое описание
-        устройства из ответа (например "Linux hostname 5.10.0 ...").
+        If port 161 is in the scanned port list, reuses the request
+        already sent there and parses the device's text description out
+        of the reply (e.g. "Linux hostname 5.10.0 ...").
 
-    Самоопрос (сканирование своего же IP)
-        На практике подтверждено: Windows по какой-то причине не отвечает
-        на NetBIOS/LLMNR/mDNS/SNMP-запросы, адресованные его собственному
-        РЕАЛЬНОМУ IP (тот же запрос с другого устройства сети получает
-        нормальный ответ). Сканер автоматически определяет свои
-        собственные IP-адреса и в этом случае уходит через 127.0.0.1
-        вместо реального адреса - там такой проблемы нет. Содержимое
-        LLMNR-запроса при этом всё равно честно спрашивает про настоящий
-        IP (не про loopback) - разделены адрес назначения пакета и адрес
-        внутри самого протокольного запроса.
+    Self-scanning (scanning your own IP)
+        Confirmed in practice: for some reason Windows does not respond
+        to NetBIOS/LLMNR/mDNS/SNMP requests addressed to its own REAL IP
+        (the same request from another device on the network gets a
+        normal reply). The scanner automatically detects its own IP
+        addresses and in that case routes the request through
+        127.0.0.1 instead of the real address - loopback doesn't have
+        this problem. The content of the LLMNR request still honestly
+        asks about the real IP (not about loopback) - the destination
+        address of the packet and the address inside the protocol
+        request body are handled separately.
 
 --sort-os
-    Сортировать блок "Информация об устройствах" по эвристике ОС (TTL)
-    вместо IP - удобно посмотреть все Windows-машины разом, потом все
-    Linux/embedded и т.д.
+    Sort the "Device information" block by the OS guess (TTL) instead of
+    by IP - handy for viewing all the Windows machines together, then
+    all the Linux/embedded ones, etc.
 
 --------------------------------------------------------------------------
-6. УГЛУБЛЁННОЕ ОПРЕДЕЛЕНИЕ ИМЕНИ: --deep-resolve
+6. DEEPER HOSTNAME RESOLUTION: --deep-resolve
 --------------------------------------------------------------------------
 
 --deep-resolve
-    Включает --info автоматически и добавляет ещё два, самых надёжных
-    способа определения имени компьютера:
+    Turns on --info automatically and adds two more, very reliable ways
+    to resolve a computer's name:
 
-    Обратный DNS (PTR)
-        Запрос PTR-записи через обычный DNS-сервер - по умолчанию
-        автоопределённый сетевой шлюз (можно переопределить, см.
-        --dns-server). Многие DHCP-серверы регистрируют hostname
-        клиента при выдаче аренды, поэтому PTR часто отдаёт настоящее
-        имя компьютера даже когда NetBIOS/LLMNR по каким-то причинам
-        молчат. Честно проверяется ANCOUNT (число реальных ответов) -
-        если DNS-сервер вернул NXDOMAIN с SOA-записью в Authority-
-        секции (это служебная запись о зоне, не ответ), она не будет
-        ошибочно принята за имя хоста.
+    Reverse DNS (PTR)
+        A PTR-record query via a regular DNS server - by default the
+        auto-detected network gateway (can be overridden, see
+        --dns-server). Many DHCP servers register the client's hostname
+        when handing out a lease, so PTR often returns the real computer
+        name even when NetBIOS/LLMNR are silent for some reason. ANCOUNT
+        (the actual number of answers) is honestly checked - if the DNS
+        server returned NXDOMAIN with an SOA record in the Authority
+        section (a zone-metadata record, not an answer), it will not be
+        mistaken for a hostname.
 
     SMB2 NEGOTIATE + NTLMSSP CHALLENGE (TCP 445)
-        Самый надёжный источник имени из всех. SMB2-хендшейк БЕЗ единой
-        попытки авторизации: сервер обязан прислать NTLMSSP CHALLENGE
-        как часть протокола NTLM, ещё до всякой проверки логина/пароля.
-        Из CHALLENGE извлекаются четыре поля разом: NetBIOS-имя,
-        NetBIOS-домен/рабочая группа, DNS-имя компьютера и DNS-домен.
-        Работает ОДИНАКОВО что в обычной рабочей группе, что в AD-
-        домене - именно так это делают nmap/CrackMapExec/enum4linux
-        для разведки. Для самоопроса используется настоящий IP (не
-        loopback) - на TCP-портах такой проблемы, в отличие от UDP-
-        протоколов выше, не наблюдалось.
+        The single most reliable name source. An SMB2 handshake WITHOUT
+        a single authentication attempt: the server must send back an
+        NTLMSSP CHALLENGE as part of the NTLM protocol, before any
+        login/password check even happens. Four fields are extracted
+        from the CHALLENGE at once: NetBIOS name, NetBIOS
+        domain/workgroup, DNS computer name, and DNS domain. Works
+        IDENTICALLY in a plain workgroup and in an AD domain - this is
+        exactly how nmap/CrackMapExec/enum4linux do their
+        reconnaissance. For self-scanning, the real IP is used (not
+        loopback) - on TCP ports, unlike the UDP protocols above, this
+        problem was not observed.
 
 --dns-server IP
-    Свой DNS-сервер для PTR-запросов при --deep-resolve, вместо
-    автоопределённого шлюза. Полезно, если в сети есть отдельный DNS-
-    сервер/AD-контроллер, который ведёт более полную и точную зону,
-    чем домашний роутер.
+    Your own DNS server for PTR queries with --deep-resolve, instead of
+    the auto-detected gateway. Useful if the network has a dedicated DNS
+    server/AD controller that maintains a fuller and more accurate zone
+    than a home router.
 
 --------------------------------------------------------------------------
-7. ВЫВОД И СОХРАНЕНИЕ РЕЗУЛЬТАТА
+7. OUTPUT AND SAVING RESULTS
 --------------------------------------------------------------------------
 
---out <путь>
-    Файл результата (по умолчанию scan_result.txt). Формат:
+--out <path>
+    The results file (default: scan_result.txt). Format:
 
-        Хостов: N   Портов: N   Потоков: N   Режим: ...   Таймаут: ... мс
-        Диапазон: <как введено>
-        Порты: <как введено>
-        Файл результатов: <путь>
-        [прогресс-бар(ы)]
-        Сканирование завершено за N.N сек.
+        Hosts: N   Ports: N   Threads: N   Mode: ...   Timeout: ... ms
+        Range: <as entered>
+        Ports: <as entered>
+        Results file: <path>
+        [progress bar(s)]
+        Scan finished in N.N sec.
 
         TCP
         ip:port
@@ -427,140 +431,140 @@ UDP - протокол без хендшейка: пустой "пробник" 
         UDP
         ip:port
 
-        Информация об устройствах:      (только если --info)
+        Device information:                (only with --info)
         ip
-          MAC: ... (Вендор)
-          TTL: N -> ОС
-          Тип (по портам): ...
-          NetBIOS: имя=... группа/домен=...
+          MAC: ... (Vendor)
+          TTL: N -> OS
+          Type (by ports): ...
+          NetBIOS: name=... group/domain=...
           SNMP sysDescr: ...
           mDNS: ...
-          LLMNR (имя компьютера): ...
-          PTR (обратный DNS): ...          (только если --deep-resolve)
-          SMB NetBIOS: имя=... домен=...   (только если --deep-resolve)
-          SMB DNS: имя=... домен=...       (только если --deep-resolve)
+          LLMNR (computer name): ...
+          PTR (reverse DNS): ...           (only with --deep-resolve)
+          SMB NetBIOS: name=... domain=... (only with --deep-resolve)
+          SMB DNS: name=... domain=...     (only with --deep-resolve)
         ******************************************************************
         ip
           ...
 
 --resume, -r
-    Дописывать результат в конец файла вместо перезаписи, отделяя
-    разные по времени сканирования двумя пустыми строками. Удобно для
-    накопительного журнала мониторинга одного и того же диапазона.
+    Append the results to the end of the file instead of overwriting it,
+    separating scans taken at different times with two blank lines.
+    Handy for a cumulative monitoring log of the same range over time.
 
 --when, -w
-    Записывать дату и время сканирования перед блоком результатов, в
-    формате "07:15:00  12.07.2026". Особенно полезно вместе с --resume.
+    Write the date and time of the scan before the results block, in
+    the format "07:15:00  12.07.2026". Especially useful together with
+    --resume.
 
 --sort-by-port
-    Дополнительно создаёт файл <имя>_by_port.<расширение> с теми же
-    результатами, но отсортированными сначала по порту, потом по IP.
-    Основной файл (сортировка по IP) при этом не меняется - оба
-    варианта сохраняются одновременно.
+    Additionally creates a file <name>_by_port.<ext> with the same
+    results, sorted first by port, then by IP. The main file (sorted by
+    IP) is left unchanged - both variants are saved at the same time.
 
 --------------------------------------------------------------------------
-8. БАЗА MAC-ВЕНДОРОВ (OUI)
+8. MAC VENDOR DATABASE (OUI)
 --------------------------------------------------------------------------
 
 --update-oui
-    Скачивает актуальную базу соответствий MAC-префикс -> вендор с
-    GitHub (репозиторий nmap, данные из официального реестра IEEE,
-    ~52000 записей) в файл oui.txt рядом с exe, и завершает работу
-    (не требует --ip/--ports). Скачивание идёт по HTTPS через штатный
-    WinINet - работает без установки дополнительных библиотек.
+    Downloads a current MAC-prefix -> vendor mapping from GitHub (the
+    nmap repository, sourced from the official IEEE registry, ~52,000
+    entries) into oui.txt next to the exe, then exits (does not require
+    --ip/--ports). Downloaded over HTTPS via the standard WinINet API -
+    no extra libraries need to be installed.
 
-    Если базы нет - определение вендора по MAC просто не работает,
-    сам MAC-адрес при этом всё равно показывается. Для изолированной
-    (без интернета) машины файл oui.txt можно скопировать вручную -
-    сканер сам найдёт его рядом со своим exe при следующем запуске.
+    Without the database, vendor lookup by MAC simply doesn't happen -
+    the MAC address itself is still shown either way. For an isolated
+    (offline) machine, oui.txt can be copied over by hand - the scanner
+    will find it next to its own exe on the next run.
 
 --------------------------------------------------------------------------
-9. ПРОЧЕЕ
+9. MISCELLANEOUS
 --------------------------------------------------------------------------
 
 --help, -h
-    Показать краткую справку по параметрам.
+    Show a short summary of the available options.
 
-Индикатор запуска: первая строка "NetScan запущен, обрабатываю
-параметры..." печатается сразу же при старте, ещё до разбора остальных
-аргументов - чтобы не создавалось впечатление, что программа зависла в
-момент запуска (актуально, если Windows Defender/SmartScreen делает
-проверку репутации неподписанного exe перед первым запуском - это
-происходит на стороне ОС, до начала выполнения кода сканера, и никак не
-лечится на уровне самой программы, кроме подписи exe сертификатом).
+Startup indicator: the line "NetScan started, parsing arguments..." is
+printed immediately at startup, before any other argument parsing - so
+the program doesn't appear to hang right after launch (relevant if
+Windows Defender/SmartScreen is doing a reputation check on an unsigned
+exe before its first run - that happens at the OS level, before the
+scanner's own code even starts running, and can't be fixed from inside
+the program itself, short of signing the exe with a certificate).
 
-Вывод в консоль работает через нативный Win32 API (WriteConsoleW) вместо
-обычного printf - это надёжно отображает кириллицу на любой версии
-Windows Vista-11 независимо от текущей кодовой страницы cmd.exe. При
-перенаправлении вывода в файл/pipe используется обычный UTF-8.
+Console output goes through the native Win32 API (WriteConsoleW) instead
+of plain printf - this reliably displays Cyrillic (and other non-ASCII
+text) on any Windows Vista-11 version regardless of the current cmd.exe
+code page. When output is redirected to a file/pipe, plain UTF-8 is used
+instead.
 
 
-ТРЕБОВАНИЯ И СОВМЕСТИМОСТЬ
+REQUIREMENTS AND COMPATIBILITY
 ================================================================================
 
-  - Windows Vista, 7, 8, 8.1, 10, 11 (x86 и x64 отдельными сборками).
-  - Права администратора НЕ требуются для базового сканирования и для
-    всей диагностики --info/--deep-resolve.
-  - Никаких сторонних драйверов (Npcap/WinPcap) не требуется и не
-    устанавливается.
-  - Статическая линковка - дополнительные .dll на целевой машине не
-    нужны.
-  - SYN-скан (как в masscan) технически невозможен без Npcap/WinPcap -
-    начиная с Windows XP SP2 система блокирует произвольную отправку
-    сырых TCP-заголовков через raw socket на уровне ядра. Поэтому
-    --mode fast - это async connect() с высокой конкурентностью, а не
-    буквальный SYN-флуд.
+  - Windows Vista, 7, 8, 8.1, 10, 11 (separate x86 and x64 builds).
+  - Administrator rights are NOT required for basic scanning or for any
+    of the --info/--deep-resolve diagnostics.
+  - No third-party drivers (Npcap/WinPcap) are required or installed.
+  - Statically linked - no extra .dll files are needed on the target
+    machine.
+  - A SYN scan (like masscan's) is technically impossible without
+    Npcap/WinPcap - since Windows XP SP2 the OS has blocked arbitrary
+    raw TCP header injection at the kernel level. That's why --mode fast
+    is a high-concurrency async connect() scan, not a literal SYN flood.
 
 
-TODO / ПЛАНЫ НА БУДУЩЕЕ
+TODO / FUTURE PLANS
 ================================================================================
 
-Обсуждались, но ПОКА НЕ РЕАЛИЗОВАНЫ:
+Discussed but NOT YET IMPLEMENTED:
 
-  [ ] Большой WMI-блок (через DCOM и через WinRM - оба варианта нужны):
-        - точная версия и сборка ОС (Windows XP - 11, Server 2003 - 2025)
-        - дата/время последней загрузки ОС
-        - число ядер процессора и объём ОЗУ (сразу видно, у кого пора
-          проапгрейдить железо)
-        - опционально - модель видеоадаптера (для нужд отдела дизайна)
-        - залогиненный пользователь на каждой машине
-        - время логона и время логоффа
-        - время бездействия (idle time) - ВАЖНАЯ ОГОВОРКА: это
-          единственная метрика, которую физически невозможно узнать
-          удалённо стандартными средствами Windows в принципе.
-          GetLastInputInfo() работает только локально на самой машине.
-          Без лёгкого агента, устанавливаемого на каждую машину и
-          самостоятельно отдающего это значение по запросу - узнать
-          его удалённо нельзя никак, это архитектурное ограничение
-          Windows, а не вопрос прав доступа.
-        - оба варианта авторизации: доменный админ (SSO) и ручной
-          ввод логин/пароль на каждый запуск - оба сценария нужны.
-        - оба транспорта: классический DCOM (порт 135 + динамический
-          RPC-диапазон) и современный WinRM/PowerShell Remoting
-          (порт 5985/5986, требует Enable-PSRemoting на целевых
-          машинах заранее).
+  [ ] A larger WMI layer (both via DCOM and via WinRM - both are needed):
+        - exact OS version and build (Windows XP - 11, Server 2003 - 2025)
+        - OS last-boot date/time
+        - CPU core count and RAM size (an easy way to see who needs a
+          hardware upgrade)
+        - optionally, GPU model (useful for a design team's needs)
+        - currently logged-in user on each machine
+        - logon time and logoff time
+        - idle time - AN IMPORTANT CAVEAT: this is the one metric that
+          is fundamentally impossible to obtain remotely with standard
+          Windows tools. GetLastInputInfo() only works locally, on the
+          machine itself. Without a lightweight agent installed on each
+          machine that reports this value on request, it cannot be
+          obtained remotely at all - this is an architectural limitation
+          of Windows, not a matter of permissions.
+        - both authentication modes: domain admin (SSO) and manually
+          entering a login/password on each run - both scenarios are
+          needed.
+        - both transports: classic DCOM (port 135 + a dynamic RPC port
+          range) and modern WinRM/PowerShell Remoting (port 5985/5986,
+          requires Enable-PSRemoting on the target machines beforehand).
 
-  [ ] Удалённое управление настройками через реестр/WMI-DCOM:
-        включение нужных правил файрвола (Network Discovery, NetBIOS,
-        LLMNR), включение "Обнаружения сети", NetBIOS over TCP/IP и
-        т.п. - без этого контроля многие узлы информации из большого
-        WMI-блока просто не будут доступны на "непричёсанных" машинах
-        домена. Реализуется тем же DCOM/удалённый-реестр слоем.
+  [ ] Remote configuration via registry/WMI-DCOM:
+        enabling the necessary firewall rules (Network Discovery,
+        NetBIOS, LLMNR), enabling "Network Discovery", NetBIOS over
+        TCP/IP, etc. - without this, many pieces of information from the
+        larger WMI layer simply won't be available on "unconfigured"
+        domain machines. Implemented via the same DCOM/remote-registry
+        layer.
 
-  [ ] GUI-версия поверх уже готового консольного ядра.
+  [ ] A GUI version built on top of the already-working console core.
 
-  [ ] WS-Discovery (UDP 3702) как дополнительный источник имени
-      компьютера - то же, чем пользуется "Сеть" в проводнике Windows
-      для отображения "дружественных" имён устройств. Сложнее в
-      разборе (нужен минимальный SOAP/XML-парсинг), отложено как
-      менее приоритетное по сравнению с уже реализованными способами.
+  [ ] WS-Discovery (UDP 3702) as an additional computer-name source -
+      the same mechanism Windows Explorer's "Network" view uses to
+      display "friendly" device names. More involved to parse (needs a
+      minimal SOAP/XML parser), deprioritized relative to the methods
+      already implemented.
 
-  [ ] Более строгий/полный парсер mDNS с честным разбором DNS-сжатия
-      и структуры записей (сейчас - прагматичный best-effort: просто
-      вытаскивается самая длинная печатаемая подстрока из ответа).
+  [ ] A stricter/more complete mDNS parser with proper DNS-compression
+      and record-structure handling (currently a pragmatic best-effort
+      approach: just extracting the longest printable substring from
+      the reply).
 
 
 ================================================================================
-Собрано кросс-компиляцией mingw-w64 (x86_64-w64-mingw32-gcc /
-i686-w64-mingw32-gcc), статическая линковка (-static -static-libgcc).
+Built via mingw-w64 cross-compilation (x86_64-w64-mingw32-gcc /
+i686-w64-mingw32-gcc), statically linked (-static -static-libgcc).
 ================================================================================

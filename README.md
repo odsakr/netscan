@@ -1,12 +1,14 @@
 # NetScan
 
-A lightweight console TCP/UDP scanner for Windows local networks (Vista — 11, x86/x64).
+NetScan - a lightweight command-line TCP/UDP local network scanner for
+Windows Vista through 11 (x86/x64), without Npcap/WinPcap and without
+administrator privileges.
 
 Written in C, cross-compiled with mingw-w64 from Linux with static linking —
 no administrator rights, no third-party drivers (Npcap/WinPcap), and no
 extra `.dll` files needed on the target machine.
 
-Full documentation (in Russian): [HELP.txt](HELP.txt)
+Full documentation: [HELP.txt](HELP.txt)
 
 ## Features at a glance
 
