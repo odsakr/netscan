@@ -1,27 +1,32 @@
 # NetScan
 
-Лёгкий консольный TCP/UDP сканер локальной сети для Windows (Vista — 11, x86/x64).
+A lightweight console TCP/UDP scanner for Windows local networks (Vista — 11, x86/x64).
 
-Написан на C, собирается кросс-компилятором mingw-w64 из Linux со статической
-линковкой — на целевой машине не нужны ни права администратора, ни сторонние
-драйверы (Npcap/WinPcap), ни какие-либо дополнительные `.dll`.
+Written in C, cross-compiled with mingw-w64 from Linux with static linking —
+no administrator rights, no third-party drivers (Npcap/WinPcap), and no
+extra `.dll` files needed on the target machine.
 
-Полная документация: [HELP.txt](HELP.txt)
+Full documentation (in Russian): [HELP.txt](HELP.txt)
 
-## Возможности вкратце
+## Features at a glance
 
-- Многопоточное сканирование TCP и UDP, параллельно или по очереди
-- Настоящий асинхронный `fast`-режим (сотни/тысячи проверок одновременно на поток)
-- Разведка живых хостов через ICMP **и** ARP разом (`--discover`)
-- Протокол-специфичные UDP-пробники (DNS/NTP/SNMP) вместо пустого пакета
-- Диагностика найденных устройств без лишней сетевой нагрузки (`--info`):
-  MAC + вендор по базе OUI, эвристика ОС по TTL, тип устройства по портам,
-  NetBIOS, mDNS, LLMNR, SNMP sysDescr
-- Углублённое определение имени компьютера (`--deep-resolve`): обратный DNS
-  и SMB2/NTLMSSP-хендшейк без аутентификации (работает и в рабочей группе, и в AD)
-- Гибкий вывод: дозапись с метками времени, сортировка по IP и по портам одновременно
+- Multi-threaded TCP and UDP scanning, in parallel or sequentially
+- A genuinely asynchronous `fast` mode (hundreds/thousands of concurrent
+  checks per thread via async connect + select, no fake multi-threading)
+- Live-host discovery via ICMP **and** ARP at once (`--discover`) — finds
+  devices even when ICMP is disabled on them
+- Protocol-specific UDP probes (DNS/NTP/SNMP) instead of an empty packet,
+  since most services silently ignore malformed probes
+- Low-cost device fingerprinting, one request per host rather than per port
+  (`--info`): MAC + vendor from an OUI database, OS guess from TTL, device
+  type from open-port patterns, NetBIOS, mDNS, LLMNR, SNMP sysDescr
+- Deeper hostname resolution (`--deep-resolve`): reverse DNS and an
+  unauthenticated SMB2/NTLMSSP handshake (works both in a workgroup and
+  in an AD domain)
+- Flexible output: append mode with timestamps, simultaneous sort-by-IP
+  and sort-by-port result files
 
-## Быстрый старт
+## Quick start
 
 ```
 netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 22,80,443,445,3389 ^
@@ -29,8 +34,8 @@ netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 22,80,443,445,3389 ^
                  --discover --info --out result.txt
 ```
 
-Готовые бинарники (x64 и x86) — в папке [`releases/`](releases/).
-Собрать самостоятельно:
+Prebuilt binaries (x64 and x86) are in [`releases/`](releases/).
+Build it yourself:
 
 ```
 x86_64-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x64.exe \
@@ -40,12 +45,30 @@ i686-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x86.exe \
     -lws2_32 -liphlpapi -lwininet -static -static-libgcc
 ```
 
+## Why not just use nmap?
+
+Nmap is great, but this project scratches a specific itch: no scan progress
+display, and it's fairly heavy for quick everyday checks. NetScan aims to be
+small, fast to reach for, and self-sufficient — no bundled driver, no admin
+prompt, just an .exe you can drop anywhere.
+
+## Requirements & compatibility
+
+- Windows Vista, 7, 8, 8.1, 10, 11 — separate x86 and x64 builds
+- No administrator rights required for scanning or for `--info`/`--deep-resolve`
+- No third-party drivers required or installed
+- Statically linked — no extra DLLs needed on the target machine
+- A true raw-socket SYN scan (like masscan) is not possible without
+  Npcap/WinPcap — Windows has blocked arbitrary raw TCP header injection
+  at the kernel level since XP SP2. `--mode fast` is therefore a
+  high-concurrency async connect() scan, not a literal SYN flood.
+
 ## TODO
 
-См. раздел TODO в конце [HELP.txt](HELP.txt) — там же зафиксирован план по
-WMI-диагностике (версия ОС, ядра/RAM, залогиненный пользователь) и
-удалённому управлению настройками через DCOM/WinRM.
+See the TODO section at the end of [HELP.txt](HELP.txt) — it covers the
+planned WMI-based diagnostics layer (exact OS version/build, CPU cores,
+RAM, logged-in user) and remote configuration via DCOM/WinRM.
 
-## Лицензия
+## License
 
-Пока не определена.
+Not decided yet.
