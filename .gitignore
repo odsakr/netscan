@@ -1,0 +1,6 @@
+*.o
+*.obj
+oui.txt
+scan_result.txt
+result*.txt
+*.log
