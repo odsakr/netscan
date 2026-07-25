@@ -25,6 +25,10 @@ Full documentation: [HELP.txt](HELP.txt)
 - Deeper hostname resolution (`--deep-resolve`): reverse DNS and an
   unauthenticated SMB2/NTLMSSP handshake (works both in a workgroup and
   in an AD domain)
+- Hardware/OS inventory over WMI (`--wmi`, requires real credentials —
+  unlike everything above): exact OS version/build, last boot time,
+  CPU cores, RAM, currently logged-on user; supports both SSO and
+  explicit `--wmi-user`/`--wmi-password`
 - Flexible output: append mode with timestamps, simultaneous sort-by-IP
   and sort-by-port result files
 
@@ -41,10 +45,10 @@ Build it yourself:
 
 ```
 x86_64-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x64.exe \
-    -lws2_32 -liphlpapi -lwininet -static -static-libgcc
+    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -static -static-libgcc
 
 i686-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x86.exe \
-    -lws2_32 -liphlpapi -lwininet -static -static-libgcc
+    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -static -static-libgcc
 ```
 
 ## Why not just use nmap?

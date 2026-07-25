@@ -19,6 +19,9 @@
 #include <icmpapi.h>
 #include <iphlpapi.h>
 #include <wininet.h>
+#define COBJMACROS
+#include <objbase.h>
+#include <wbemidl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +32,9 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 /* ---------------------------------------------------------------------- */
 /* Общие структуры                                                        */
@@ -110,6 +116,19 @@ static char g_out_path[MAX_PATH] = "scan_result.txt";
 static int g_info_mode = 0;         /* --info: собирать доп. информацию об устройствах */
 static int g_deep_resolve = 0;      /* --deep-resolve: доп. способы определения имени (PTR через DNS, SMB2/NTLMSSP) */
 static uint32_t g_dns_server_override = 0; /* --dns-server: свой DNS-сервер для обратных PTR-запросов вместо шлюза */
+
+/* ---------------------------------------------------------------------- */
+/* WMI через DCOM (--wmi): версия ОС, время загрузки, ядра/RAM,           */
+/* залогиненный пользователь. Требует прав на целевой машине (SSO текущим */
+/* пользователем ЛИБО явные логин/пароль) - в отличие от всей остальной   */
+/* диагностики выше, это НЕ анонимные протокольные запросы.               */
+/* ---------------------------------------------------------------------- */
+static int g_wmi_mode = 0;
+static int g_wmi_gpu = 0;         /* --wmi-gpu: дополнительно запросить модель видеоадаптера */
+static char g_wmi_user[128] = ""; /* --wmi-user: пусто = текущий пользователь (SSO) */
+static char g_wmi_password[128] = "";
+static char g_wmi_domain[128] = ""; /* --wmi-domain: опционально, для user -> DOMAIN\user */
+static int g_wmi_com_ready = 0;   /* CoInitializeSecurity выполнен успешно в главном потоке */
 static int g_update_oui_only = 0;   /* --update-oui: только скачать базу OUI и выйти */
 #define OUI_URL "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes"
 
@@ -146,6 +165,16 @@ typedef struct {
     char smb_nb_domain[64];
     char smb_dns_name[128];
     char smb_dns_domain[128];
+    int has_wmi;
+    char wmi_error[160];      /* причина неудачи - важно для диагностики прав/файрвола */
+    char wmi_os_caption[128]; /* "Microsoft Windows 10 Pro" и т.п. */
+    char wmi_os_version[64];  /* "10.0.19045" */
+    char wmi_os_build[32];
+    char wmi_boot_time[32];   /* дата/время последней загрузки, человекочитаемо */
+    int wmi_cpu_cores;
+    double wmi_ram_gb;
+    char wmi_logged_user[128];
+    char wmi_gpu[128];
     const char *device_guess;
 } HostInfo;
 
@@ -1560,6 +1589,227 @@ static int smb_get_names(uint32_t ip_h, int timeout_ms,
    обращений (ICMP если TTL ещё не известен, SNMP, NetBIOS, mDNS) - но
    ОДИН РАЗ НА ХОСТ, не на порт, поэтому не влияет на скорость самого
    скана портов. */
+/* ---------------------------------------------------------------------- */
+/* WMI через DCOM. В отличие от всей диагностики выше (--info/           */
+/* --deep-resolve), это НЕ анонимные протокольные запросы - нужны права   */
+/* на целевой машине (SSO текущим пользователем, либо явные логин/пароль).*/
+/* ---------------------------------------------------------------------- */
+
+static void ascii_to_wide(const char *s, wchar_t *out, size_t cap) {
+    size_t i = 0;
+    for (; s[i] && i + 1 < cap; i++) out[i] = (wchar_t)(unsigned char)s[i];
+    out[i] = 0;
+}
+
+static void bstr_to_narrow(BSTR b, char *out, size_t cap) {
+    if (!b) { out[0] = 0; return; }
+    int n = WideCharToMultiByte(CP_UTF8, 0, b, -1, out, (int)cap, NULL, NULL);
+    if (n <= 0) out[0] = 0;
+}
+
+/* WMI хранит дату в формате DMTF: "20260722143500.000000+180" */
+static void format_wmi_datetime(const char *dmtf, char *out, size_t cap) {
+    out[0] = 0;
+    if (!dmtf || strlen(dmtf) < 14) return;
+    char year[5], mon[3], day[3], hh[3], mm[3], ss[3];
+    memcpy(year, dmtf, 4);     year[4] = 0;
+    memcpy(mon,  dmtf + 4, 2); mon[2]  = 0;
+    memcpy(day,  dmtf + 6, 2); day[2]  = 0;
+    memcpy(hh,   dmtf + 8, 2); hh[2]   = 0;
+    memcpy(mm,   dmtf + 10, 2); mm[2]  = 0;
+    memcpy(ss,   dmtf + 12, 2); ss[2]  = 0;
+    snprintf(out, cap, "%s.%s.%s %s:%s:%s", day, mon, year, hh, mm, ss);
+}
+
+static void wmi_get_string_prop(IWbemClassObject *obj, const wchar_t *name, char *out, size_t cap) {
+    out[0] = 0;
+    VARIANT vt;
+    VariantInit(&vt);
+    if (SUCCEEDED(IWbemClassObject_Get(obj, name, 0, &vt, 0, 0)) && vt.vt == VT_BSTR) {
+        bstr_to_narrow(vt.bstrVal, out, cap);
+    }
+    VariantClear(&vt);
+}
+
+static int wmi_get_int_prop(IWbemClassObject *obj, const wchar_t *name, int *out) {
+    VARIANT vt;
+    VariantInit(&vt);
+    int ok = 0;
+    if (SUCCEEDED(IWbemClassObject_Get(obj, name, 0, &vt, 0, 0))) {
+        if (vt.vt == VT_I4) { *out = vt.lVal; ok = 1; }
+        else if (vt.vt == VT_UI4) { *out = (int)vt.ulVal; ok = 1; }
+        else if (vt.vt == VT_I2) { *out = vt.iVal; ok = 1; }
+    }
+    VariantClear(&vt);
+    return ok;
+}
+
+/* TotalPhysicalMemory приходит строкой (может не влезать в 32 бита) */
+static int wmi_get_uint64_str_prop(IWbemClassObject *obj, const wchar_t *name, double *out_gb) {
+    VARIANT vt;
+    VariantInit(&vt);
+    int ok = 0;
+    if (SUCCEEDED(IWbemClassObject_Get(obj, name, 0, &vt, 0, 0))) {
+        char buf[32] = "";
+        if (vt.vt == VT_BSTR) bstr_to_narrow(vt.bstrVal, buf, sizeof(buf));
+        else if (vt.vt == VT_UI8) snprintf(buf, sizeof(buf), "%llu", (unsigned long long)vt.ullVal);
+        if (buf[0]) {
+            double bytes = atof(buf);
+            *out_gb = bytes / (1024.0 * 1024.0 * 1024.0);
+            ok = 1;
+        }
+    }
+    VariantClear(&vt);
+    return ok;
+}
+
+/* Одна WQL-выборка, разбор первой строки результата через callback */
+typedef void (*WmiRowFn)(IWbemClassObject *obj, HostInfo *hi);
+
+static int wmi_run_query(IWbemServices *svc, const wchar_t *wql, WmiRowFn fn, HostInfo *hi) {
+    BSTR lang = SysAllocString(L"WQL");
+    BSTR query = SysAllocString(wql);
+    IEnumWbemClassObject *pEnum = NULL;
+    HRESULT hr = IWbemServices_ExecQuery(svc, lang, query,
+                                          WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                                          NULL, &pEnum);
+    SysFreeString(lang);
+    SysFreeString(query);
+    if (FAILED(hr) || !pEnum) return 0;
+
+    IWbemClassObject *obj = NULL;
+    ULONG got = 0;
+    int ok = 0;
+    if (IEnumWbemClassObject_Next(pEnum, 5000, 1, &obj, &got) == S_OK && got) {
+        fn(obj, hi);
+        IWbemClassObject_Release(obj);
+        ok = 1;
+    }
+    IEnumWbemClassObject_Release(pEnum);
+    return ok;
+}
+
+static void wmi_row_os(IWbemClassObject *obj, HostInfo *hi) {
+    wmi_get_string_prop(obj, L"Caption", hi->wmi_os_caption, sizeof(hi->wmi_os_caption));
+    wmi_get_string_prop(obj, L"Version", hi->wmi_os_version, sizeof(hi->wmi_os_version));
+    wmi_get_string_prop(obj, L"BuildNumber", hi->wmi_os_build, sizeof(hi->wmi_os_build));
+
+    char raw_boot[64];
+    wmi_get_string_prop(obj, L"LastBootUpTime", raw_boot, sizeof(raw_boot));
+    format_wmi_datetime(raw_boot, hi->wmi_boot_time, sizeof(hi->wmi_boot_time));
+}
+
+static void wmi_row_computer_system(IWbemClassObject *obj, HostInfo *hi) {
+    wmi_get_int_prop(obj, L"NumberOfLogicalProcessors", &hi->wmi_cpu_cores);
+    wmi_get_uint64_str_prop(obj, L"TotalPhysicalMemory", &hi->wmi_ram_gb);
+    /* UserName - "DOMAIN\\user", текущий залогиненный интерактивно пользователь;
+       пусто, если на машине никто не залогинен */
+    wmi_get_string_prop(obj, L"UserName", hi->wmi_logged_user, sizeof(hi->wmi_logged_user));
+}
+
+static void wmi_row_gpu(IWbemClassObject *obj, HostInfo *hi) {
+    wmi_get_string_prop(obj, L"Name", hi->wmi_gpu, sizeof(hi->wmi_gpu));
+}
+
+/* Основная точка входа: подключается к \\ip\root\cimv2 через DCOM и
+   собирает ОС/железо/пользователя. При явных --wmi-user/--wmi-password
+   аутентифицируется под ними, иначе - под текущим пользователем (SSO). */
+static int wmi_query_host(uint32_t ip_h, HostInfo *hi) {
+    if (!g_wmi_com_ready) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "COM не инициализирован");
+        return 0;
+    }
+
+    /* Быстрая предпроверка порта 135 (DCOM endpoint mapper) нашим же
+       TCP-коннектом с коротким таймаутом. ConnectServer сам по себе не
+       даёт настроить таймаут - использует RPC-таймаут ОС по умолчанию,
+       который на недоступном/зафильтрованном хосте может занимать
+       20+ секунд. Без этой проверки --wmi по диапазону, где DCOM не
+       открыт у большинства хостов, был бы практически неюзабельным. */
+    if (!tcp_check(ip_h, 135, 700)) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "порт 135 (DCOM) недоступен");
+        return 0;
+    }
+
+    char ipstr[64];
+    u32_to_ip_str(ip_h, ipstr, sizeof(ipstr));
+    wchar_t wip[64];
+    ascii_to_wide(ipstr, wip, sizeof(wip) / sizeof(wchar_t));
+
+    wchar_t wpath[160];
+    wcscpy(wpath, L"\\\\");
+    wcscat(wpath, wip);
+    wcscat(wpath, L"\\root\\cimv2");
+
+    IWbemLocator *pLoc = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IWbemLocator, (LPVOID *)&pLoc);
+    if (FAILED(hr) || !pLoc) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "CoCreateInstance: 0x%08lX", (unsigned long)hr);
+        return 0;
+    }
+
+    BSTR bpath = SysAllocString(wpath);
+    BSTR buser = NULL, bpass = NULL;
+    if (g_wmi_user[0]) {
+        wchar_t wuser[256] = L"";
+        if (g_wmi_domain[0]) {
+            wchar_t wd[128], wu[128];
+            ascii_to_wide(g_wmi_domain, wd, 128);
+            ascii_to_wide(g_wmi_user, wu, 128);
+            wcscpy(wuser, wd); wcscat(wuser, L"\\"); wcscat(wuser, wu);
+        } else {
+            ascii_to_wide(g_wmi_user, wuser, 256);
+        }
+        buser = SysAllocString(wuser);
+        wchar_t wpass[256];
+        ascii_to_wide(g_wmi_password, wpass, 256);
+        bpass = SysAllocString(wpass);
+    }
+
+    IWbemServices *pSvc = NULL;
+    hr = IWbemLocator_ConnectServer(pLoc, bpath, buser, bpass, NULL, 0, NULL, NULL, &pSvc);
+
+    if (buser) SysFreeString(buser);
+    if (bpass) SysFreeString(bpass);
+    SysFreeString(bpath);
+
+    if (FAILED(hr) || !pSvc) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "ConnectServer: 0x%08lX "
+                 "(нет доступа/файрвол/DCOM выключен на цели)", (unsigned long)hr);
+        IWbemLocator_Release(pLoc);
+        return 0;
+    }
+
+    hr = CoSetProxyBlanket((IUnknown *)pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                            RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+    if (FAILED(hr)) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "CoSetProxyBlanket: 0x%08lX", (unsigned long)hr);
+        IWbemServices_Release(pSvc);
+        IWbemLocator_Release(pLoc);
+        return 0;
+    }
+
+    int got_os = wmi_run_query(pSvc, L"SELECT Caption,Version,BuildNumber,LastBootUpTime "
+                                      L"FROM Win32_OperatingSystem", wmi_row_os, hi);
+    int got_cs = wmi_run_query(pSvc, L"SELECT NumberOfLogicalProcessors,TotalPhysicalMemory,UserName "
+                                      L"FROM Win32_ComputerSystem", wmi_row_computer_system, hi);
+    if (g_wmi_gpu) {
+        wmi_run_query(pSvc, L"SELECT Name FROM Win32_VideoController", wmi_row_gpu, hi);
+    }
+
+    IWbemServices_Release(pSvc);
+    IWbemLocator_Release(pLoc);
+
+    if (!got_os && !got_cs) {
+        snprintf(hi->wmi_error, sizeof(hi->wmi_error), "Подключились, но запросы не вернули данных "
+                 "(прав недостаточно?)");
+        return 0;
+    }
+    hi->has_wmi = 1;
+    return 1;
+}
+
 static void gather_host_info(HostInfo *hi) {
     if (!hi->has_ttl) {
         int ttl;
@@ -1609,6 +1859,10 @@ static void gather_host_info(HostInfo *hi) {
         }
     }
 
+    if (g_wmi_mode) {
+        wmi_query_host(hi->ip, hi);
+    }
+
     hi->device_guess = guess_device_by_ports(hi->ip);
 }
 
@@ -1618,11 +1872,15 @@ static void wait_for_all_threads(HANDLE *handles, int count); /* определ�
 
 static DWORD WINAPI worker_info(LPVOID param) {
     (void)param;
+    if (g_wmi_mode) CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
     for (;;) {
         LONG64 idx = InterlockedIncrement64((volatile LONG64 *)&g_info_claim) - 1;
         if (idx >= g_host_info_count) break;
         gather_host_info(&g_host_infos[idx]);
     }
+
+    if (g_wmi_mode) CoUninitialize();
     return 0;
 }
 
@@ -1770,6 +2028,33 @@ static void print_host_info_section(FILE *f) {
                 conprintf("  SMB DNS: имя=%s домен=%s\n", hi->smb_dns_name, hi->smb_dns_domain);
                 if (f) fprintf(f, "  SMB DNS: имя=%s домен=%s\n", hi->smb_dns_name, hi->smb_dns_domain);
             }
+        }
+        if (hi->has_wmi) {
+            if (hi->wmi_os_caption[0]) {
+                conprintf("  WMI ОС: %s (версия %s, сборка %s)\n",
+                          hi->wmi_os_caption, hi->wmi_os_version, hi->wmi_os_build);
+                if (f) fprintf(f, "  WMI ОС: %s (версия %s, сборка %s)\n",
+                               hi->wmi_os_caption, hi->wmi_os_version, hi->wmi_os_build);
+            }
+            if (hi->wmi_boot_time[0]) {
+                conprintf("  WMI загружена: %s\n", hi->wmi_boot_time);
+                if (f) fprintf(f, "  WMI загружена: %s\n", hi->wmi_boot_time);
+            }
+            if (hi->wmi_cpu_cores > 0 || hi->wmi_ram_gb > 0) {
+                conprintf("  WMI железо: %d ядер, %.1f ГБ ОЗУ\n", hi->wmi_cpu_cores, hi->wmi_ram_gb);
+                if (f) fprintf(f, "  WMI железо: %d ядер, %.1f ГБ ОЗУ\n", hi->wmi_cpu_cores, hi->wmi_ram_gb);
+            }
+            if (hi->wmi_logged_user[0]) {
+                conprintf("  WMI залогинен: %s\n", hi->wmi_logged_user);
+                if (f) fprintf(f, "  WMI залогинен: %s\n", hi->wmi_logged_user);
+            }
+            if (hi->wmi_gpu[0]) {
+                conprintf("  WMI видеоадаптер: %s\n", hi->wmi_gpu);
+                if (f) fprintf(f, "  WMI видеоадаптер: %s\n", hi->wmi_gpu);
+            }
+        } else if (g_wmi_mode && hi->wmi_error[0]) {
+            conprintf("  WMI: не удалось (%s)\n", hi->wmi_error);
+            if (f) fprintf(f, "  WMI: не удалось (%s)\n", hi->wmi_error);
         }
     }
 }
@@ -2350,6 +2635,16 @@ static void print_usage(const char *prog) {
         "                   Включает --info автоматически.\n"
         "  --dns-server IP  свой DNS-сервер для обратных PTR-запросов при --deep-resolve\n"
         "                   (по умолчанию - автоопределённый шлюз).\n"
+        "  --wmi            запросить через WMI/DCOM: точную версию ОС, время последней\n"
+        "                   загрузки, число ядер CPU, объём RAM, залогиненного пользователя.\n"
+        "                   ТРЕБУЕТ ПРАВ на целевой машине (в отличие от всего остального\n"
+        "                   выше) - либо текущего пользователя (SSO, порт 135 + DCOM должны\n"
+        "                   быть доступны), либо явных --wmi-user/--wmi-password. Включает\n"
+        "                   --info автоматически.\n"
+        "  --wmi-user U     логин для WMI (без указания - используется текущий пользователь).\n"
+        "  --wmi-password P пароль для WMI (используется вместе с --wmi-user).\n"
+        "  --wmi-domain D   домен для --wmi-user (опционально, для DOMAIN\\user).\n"
+        "  --wmi-gpu        дополнительно запросить через WMI модель видеоадаптера.\n"
         "  --sort-by-port   доп. файл result_by_port.txt с теми же результатами, но\n"
         "                   отсортированными по порту (основной файл по IP не меняется -\n"
         "                   сохраняются оба варианта одновременно).\n"
@@ -2408,6 +2703,17 @@ int main(int argc, char **argv) {
             g_info_mode = 1; /* --deep-resolve подразумевает --info */
         } else if (strcmp(argv[i], "--dns-server") == 0 && i + 1 < argc) {
             g_dns_server_override = ip_to_u32(argv[++i]);
+        } else if (strcmp(argv[i], "--wmi") == 0) {
+            g_wmi_mode = 1;
+            g_info_mode = 1; /* --wmi подразумевает --info */
+        } else if (strcmp(argv[i], "--wmi-gpu") == 0) {
+            g_wmi_gpu = 1;
+        } else if (strcmp(argv[i], "--wmi-user") == 0 && i + 1 < argc) {
+            strncpy(g_wmi_user, argv[++i], sizeof(g_wmi_user) - 1);
+        } else if (strcmp(argv[i], "--wmi-password") == 0 && i + 1 < argc) {
+            strncpy(g_wmi_password, argv[++i], sizeof(g_wmi_password) - 1);
+        } else if (strcmp(argv[i], "--wmi-domain") == 0 && i + 1 < argc) {
+            strncpy(g_wmi_domain, argv[++i], sizeof(g_wmi_domain) - 1);
         } else if (strcmp(argv[i], "--sort-by-port") == 0) {
             g_sort_by_port_also = 1;
         } else if (strcmp(argv[i], "--sort-os") == 0) {
@@ -2466,6 +2772,24 @@ int main(int argc, char **argv) {
     conprintf("Файл результатов: %s%s\n", g_out_path, g_resume_mode ? " (дозапись)" : "");
 
     DWORD t0 = GetTickCount();
+
+    if (g_wmi_mode) {
+        HRESULT hr_com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (SUCCEEDED(hr_com) || hr_com == S_FALSE) {
+            HRESULT hr_sec = CoInitializeSecurity(NULL, -1, NULL, NULL,
+                                                   RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+                                                   NULL, EOAC_NONE, NULL);
+            if (SUCCEEDED(hr_sec)) {
+                g_wmi_com_ready = 1;
+            } else {
+                conprintf_err("CoInitializeSecurity не удался (0x%08lX) - --wmi работать не будет\n",
+                               (unsigned long)hr_sec);
+            }
+        } else {
+            conprintf_err("CoInitializeEx не удался (0x%08lX) - --wmi работать не будет\n",
+                           (unsigned long)hr_com);
+        }
+    }
 
     if (g_discover_mode || g_info_mode) {
         load_local_subnets();

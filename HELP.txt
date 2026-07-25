@@ -165,6 +165,22 @@ USAGE EXAMPLES
     machine.
 
 
+11) Hardware/OS inventory on a network you actually administer:
+
+    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135,445
+                    --proto tcp --discover --wmi
+                    --wmi-user admin --wmi-password ****
+                    --wmi-domain CORP --mode full --threads 30
+
+    Unlike everything else in this tool, --wmi requires real rights on
+    the target machines (domain admin, or any account with WMI access).
+    Returns exact OS version/build, last boot time, CPU core count, RAM
+    size, and the currently logged-on user - the inventory you'd need to
+    plan hardware upgrades or track down who's logged in where. Omit
+    --wmi-user/--wmi-password entirely to use your current session (SSO)
+    instead of explicit credentials.
+
+
 FULL FEATURE REFERENCE
 ================================================================================
 
@@ -412,7 +428,63 @@ All other UDP ports use the regular minimal probe.
     than a home router.
 
 --------------------------------------------------------------------------
-7. OUTPUT AND SAVING RESULTS
+7. WMI DIAGNOSTICS (VIA DCOM): --wmi
+--------------------------------------------------------------------------
+
+IMPORTANT: unlike everything described above (--info, --deep-resolve),
+this is NOT anonymous protocol-level probing. WMI genuinely requires
+rights on the target machine - either the current user's own session
+(SSO) or explicit credentials. Expect it to fail on most machines you
+don't administer.
+
+--wmi
+    Turns on --info automatically. Connects to \\<ip>\root\cimv2 over
+    classic DCOM (CoCreateInstance + IWbemLocator::ConnectServer) and
+    queries:
+      - Win32_OperatingSystem: exact OS caption/version/build number
+        (distinguishes Windows XP through 11, Server 2003 through 2025 -
+        whatever the target actually reports), and the last boot
+        date/time.
+      - Win32_ComputerSystem: logical CPU core count, total RAM, and the
+        currently interactively logged-on user (UserName - empty if
+        nobody is logged on locally).
+
+    Before attempting the (potentially slow) DCOM connection, the
+    scanner first does its own quick TCP check against port 135 (the
+    DCOM endpoint mapper) with a short, configurable-style timeout.
+    ConnectServer itself has no simple timeout knob - it relies on the
+    OS's default RPC/TCP timeout, which can run into the tens of
+    seconds against an unreachable or filtered host. Without this
+    pre-check, running --wmi across a whole range where most hosts
+    don't expose DCOM would be nearly unusable.
+
+    On failure, the specific reason is recorded and shown (e.g. "port
+    135 (DCOM) unavailable", or a raw ConnectServer HRESULT such as
+    0x80041015, which usually means access denied / firewalled / DCOM
+    disabled on the target) - this is deliberate: with a
+    rights-dependent feature like this, silent failure would be far
+    more confusing than an honest error message.
+
+--wmi-user U
+    Username for WMI authentication. If omitted, the current user's
+    session is used (SSO) - this only works if you're already running
+    as a domain/local account with rights on the target and DCOM is
+    reachable.
+
+--wmi-password P
+    Password for --wmi-user.
+
+--wmi-domain D
+    Domain for --wmi-user (optional; combined as DOMAIN\user).
+
+--wmi-gpu
+    Also queries Win32_VideoController (Name) - the GPU model. Kept
+    behind its own flag since it's a "nice to have" for design-team
+    hardware planning rather than a core diagnostic, and it's one more
+    WMI round-trip per host.
+
+--------------------------------------------------------------------------
+8. OUTPUT AND SAVING RESULTS
 --------------------------------------------------------------------------
 
 --out <path>
@@ -463,7 +535,7 @@ All other UDP ports use the regular minimal probe.
     IP) is left unchanged - both variants are saved at the same time.
 
 --------------------------------------------------------------------------
-8. MAC VENDOR DATABASE (OUI)
+9. MAC VENDOR DATABASE (OUI)
 --------------------------------------------------------------------------
 
 --update-oui
@@ -479,7 +551,7 @@ All other UDP ports use the regular minimal probe.
     will find it next to its own exe on the next run.
 
 --------------------------------------------------------------------------
-9. MISCELLANEOUS
+10. MISCELLANEOUS
 --------------------------------------------------------------------------
 
 --help, -h
@@ -520,27 +592,27 @@ TODO / FUTURE PLANS
 
 Discussed but NOT YET IMPLEMENTED:
 
-  [ ] A larger WMI layer (both via DCOM and via WinRM - both are needed):
-        - exact OS version and build (Windows XP - 11, Server 2003 - 2025)
-        - OS last-boot date/time
-        - CPU core count and RAM size (an easy way to see who needs a
-          hardware upgrade)
-        - optionally, GPU model (useful for a design team's needs)
-        - currently logged-in user on each machine
-        - logon time and logoff time
-        - idle time - AN IMPORTANT CAVEAT: this is the one metric that
-          is fundamentally impossible to obtain remotely with standard
-          Windows tools. GetLastInputInfo() only works locally, on the
-          machine itself. Without a lightweight agent installed on each
-          machine that reports this value on request, it cannot be
-          obtained remotely at all - this is an architectural limitation
-          of Windows, not a matter of permissions.
-        - both authentication modes: domain admin (SSO) and manually
-          entering a login/password on each run - both scenarios are
-          needed.
-        - both transports: classic DCOM (port 135 + a dynamic RPC port
-          range) and modern WinRM/PowerShell Remoting (port 5985/5986,
-          requires Enable-PSRemoting on the target machines beforehand).
+  [x] A DCOM/WMI layer (--wmi): exact OS version/build, last-boot time,
+        CPU core count, RAM size, currently logged-on user, optional GPU
+        model. Supports both SSO (current session) and explicit
+        --wmi-user/--wmi-password/--wmi-domain credentials. DONE.
+
+  [ ] The same diagnostics via WinRM/PowerShell Remoting (port 5985/5986)
+        as an alternative transport to DCOM - needed for environments
+        where WinRM is enabled but classic DCOM (port 135 + a dynamic RPC
+        range) is blocked or disabled. wsman.h/IWSMan are available in
+        the toolchain; not yet implemented.
+
+  [ ] Further WMI-based fields once the above is validated against a
+        real domain: logon time and logoff time.
+
+  [ ] Idle time - AN IMPORTANT CAVEAT: this is the one metric that is
+        fundamentally impossible to obtain remotely with standard
+        Windows tools. GetLastInputInfo() only works locally, on the
+        machine itself. Without a lightweight agent installed on each
+        machine that reports this value on request, it cannot be
+        obtained remotely at all - this is an architectural limitation
+        of Windows, not a matter of permissions.
 
   [ ] Remote configuration via registry/WMI-DCOM:
         enabling the necessary firewall rules (Network Discovery,
@@ -566,5 +638,6 @@ Discussed but NOT YET IMPLEMENTED:
 
 ================================================================================
 Built via mingw-w64 cross-compilation (x86_64-w64-mingw32-gcc /
-i686-w64-mingw32-gcc), statically linked (-static -static-libgcc).
+i686-w64-mingw32-gcc), statically linked (-static -static-libgcc),
+linked against ws2_32, iphlpapi, wininet, ole32, oleaut32, wbemuuid.
 ================================================================================
