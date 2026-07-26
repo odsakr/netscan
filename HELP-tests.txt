@@ -1,0 +1,444 @@
+================================================================================
+                  NetScan - test plan / verification checklist
+================================================================================
+
+Purpose: a practical checklist to run through after building netscan_x64.exe
+(or after any code change) to confirm every mode still works as expected.
+All commands below use netscan_x64.exe - swap in netscan_x86.exe separately
+if you need to verify the 32-bit build too, the flags are identical.
+
+Run these on an actual Windows machine, on a network you're allowed to
+scan. Replace 192.168.1.0/24 with your real subnet throughout. Where a
+test needs "a host with a known open port", pick anything reachable on
+your network (the router's web UI on 80/443 is usually a safe bet).
+
+Each test lists: the command, what it's checking, and what a healthy
+result looks like. Tests are grouped from cheapest/safest to most
+demanding, so you can stop early if time is short and still have
+confidence in the core scanning path.
+
+
+================================================================================
+1. SANITY CHECKS (no network range needed)
+================================================================================
+
+1.1  Help text renders correctly (encoding check)
+
+     netscan_x64.exe --help
+
+     Expect: readable Cyrillic text if your build has Russian strings,
+     or clean English text - no garbled characters (mojibake) regardless
+     of the current cmd.exe code page. Confirms WriteConsoleW output is
+     working.
+
+1.2  Missing required arguments are rejected cleanly
+
+     netscan_x64.exe --ip 192.168.1.1
+
+     Expect: usage text printed, exit without attempting a scan (no
+     --ports given).
+
+1.3  Malformed IP is rejected with a clear error, not a crash
+
+     netscan_x64.exe --ip 999.999.999.999 --ports 80 --proto tcp
+
+     Expect: "Некорректный IP адрес" (or equivalent) and a clean exit.
+
+1.4  OUI database download
+
+     netscan_x64.exe --update-oui
+
+     Expect: downloads oui.txt next to the exe (~1.3 MB, ~52000 lines),
+     prints byte count, exits without requiring --ip/--ports. Requires
+     internet access; if it's not available, confirm the error message
+     is informative rather than a silent hang.
+
+
+================================================================================
+2. BASIC PORT SCANNING (--mode full)
+================================================================================
+
+2.1  Single host, single known-open port
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 80 --proto tcp
+                     --mode full --threads 5 --timeout 800
+
+     Expect: "найдено:1", the port listed under TCP in both console and
+     the output file.
+
+2.2  Single host, a mix of open and closed ports
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 22,80,443,9,9999
+                     --proto tcp --mode full --threads 10
+
+     Expect: only genuinely open ports appear in the results; count
+     matches what you'd expect from manually checking the device.
+
+2.3  UDP with a protocol-aware probe (DNS)
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 53 --proto udp
+                     --mode full --threads 5 --timeout 1500
+
+     Expect: found, IF the target actually runs a DNS resolver
+     reachable on UDP from your scanning host (most home routers
+     qualify). This exercises the real DNS query payload, not an empty
+     probe - if this fails but you know DNS is running, see HELP.txt
+     section 3 for why (e.g. resolvers that only answer localhost, or a
+     firewall specifically blocking port 53).
+
+2.4  A full /24 sweep on a handful of ports, no --discover
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 80,443,445
+                     --proto tcp --mode full --threads 100
+
+     Expect: completes (will be noticeably slower than the --discover
+     variant below - this is the expected baseline to compare against).
+     Note the elapsed time printed at the end for comparison with 2.5.
+
+2.5  Same sweep, with --discover
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 80,443,445
+                     --proto tcp --mode full --threads 100 --discover
+
+     Expect: dramatically faster than 2.4 on a typical home/office
+     subnet where most of the 254 addresses are unused. Compare the
+     "Хостов: N" alive count against what you know is actually plugged
+     in.
+
+
+================================================================================
+3. FAST MODE
+================================================================================
+
+3.1  Fast mode against a single reachable host - correctness check
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 20-100 --proto tcp
+                     --mode fast --threads 5 --batch 16
+
+     Expect: identical set of open ports as running the same range in
+     --mode full (cross-check the two). This validates the async
+     connect+select logic isn't dropping or double-counting results.
+
+3.2  Fast mode at scale - the real speed test
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254
+                     --ports 21,22,23,25,53,80,110,143,443,445,3389,5900-5910
+                     --proto all --mode fast --threads 50 --batch 32
+                     --discover
+
+     Expect: this is the flagship "everyday" command from HELP.txt
+     example 2 - completes quickly, results consistent with a slower
+     --mode full run of the same range (spot-check a few hosts).
+
+3.3  --retries under simulated packet loss
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 80,443,445
+                     --proto all --mode fast --threads 30 --batch 16
+                     --retries 3 --timeout 1000
+
+     Expect: no crash, no hang; if your network has any flaky links,
+     compare the found-count against a --retries 1 run to confirm
+     retries are actually recovering some otherwise-missed ports.
+
+
+================================================================================
+4. PARALLEL TCP+UDP AND --sequential
+================================================================================
+
+4.1  Default: TCP and UDP scanned at the same time
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 53,80,443,161
+                     --proto all --mode full --threads 20
+
+     Expect (in a real cmd.exe window, not redirected): two separate
+     progress bars, one labeled TCP and one UDP, updating independently
+     on their own fixed lines.
+
+4.2  Forced sequential mode for comparison
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 53,80,443,161
+                     --proto all --mode full --threads 20 --sequential
+
+     Expect: single progress bar at a time (TCP first, then UDP), total
+     elapsed time roughly the sum of both phases - noticeably longer
+     than 4.1's total for the same target.
+
+
+================================================================================
+5. RESERVED ADDRESSES AND PORT DEDUPLICATION
+================================================================================
+
+5.1  x.x.x.0 / x.x.x.255 are skipped by default
+
+     netscan_x64.exe --ip 192.168.1.0-192.168.1.255 --ports 80
+                     --proto tcp --mode full --threads 20
+
+     Expect: "Пропущено адресов вида x.x.x.0/x.x.x.255" line with a
+     count of (at least) 2; neither .0 nor .255 shows up attributed to
+     a real device in the "Device information" block if --info is added.
+
+5.2  --include-reserved brings them back
+
+     netscan_x64.exe --ip 192.168.1.0-192.168.1.255 --ports 80
+                     --proto tcp --mode full --threads 20
+                     --include-reserved
+
+     Expect: no skip message; .0 and .255 are scanned like any other
+     address (results will likely show nothing open there, which is
+     also correct - the point is they were attempted).
+
+5.3  Duplicate ports in the list don't create duplicate results
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 80,443,80,22,443
+                     --proto tcp --mode full --threads 10
+
+     Expect: "Портов: 3" in the summary (not 5) - confirms
+     deduplication happened before scanning, not just at display time.
+
+
+================================================================================
+6. LIVE-HOST DISCOVERY (--discover) IN DEPTH
+================================================================================
+
+6.1  ICMP+ARP finds more than ICMP alone would
+
+     If you have a device on your LAN with ICMP explicitly disabled in
+     its own firewall (many managed switches/servers do this by
+     policy), point --discover at a range including it:
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 80
+                     --proto tcp --mode full --threads 50 --discover
+
+     Expect: "Разведка (ICMP+ARP): живых N из 254 (в подсети M
+     подключений)" - the ICMP-blocked device should still be counted as
+     alive (found via ARP) as long as it's on your directly-attached
+     subnet. If M (adapter count) is 0, this check can't run at all -
+     verify you're not scanning from inside some unusual network
+     namespace/VM setup.
+
+6.2  A genuinely empty range shows the "nobody answered" warning
+
+     netscan_x64.exe --ip 10.250.250.1-10.250.250.10 --ports 80
+                     --proto tcp --mode full --threads 10 --discover
+
+     Expect (assuming that range is actually empty on your network):
+     "живых 0 из 10" plus the explanatory warning about possible causes.
+
+
+================================================================================
+7. DEVICE DIAGNOSTICS (--info)
+================================================================================
+
+7.1  Baseline device fingerprinting sweep
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254
+                     --ports 53,80,443,161,445,5900-5910
+                     --proto all --mode fast --threads 50 --batch 32
+                     --discover --info --out result.txt
+
+     For each device found, manually verify against what you know:
+       - MAC vendor matches the actual hardware brand (needs oui.txt -
+         see test 1.4 first)
+       - TTL-based OS guess matches reality (Windows machines should
+         show TTL<=128, most everything else TTL<=64)
+       - "Тип (по портам)" guesses look sane for printers/cameras/etc.
+         if you have any on the network
+
+7.2  NetBIOS / mDNS / LLMNR on a real Windows machine
+
+     Run 7.1 against a subnet containing at least one Windows PC with
+     file sharing or a name-resolution service running. Expect at least
+     one of NetBIOS/LLMNR to return a name matching the machine's actual
+     hostname. If neither works but the machine is reachable, check on
+     that machine: `ipconfig /all` (NetBIOS over Tcpip should say
+     Enabled) and Windows Firewall's Network Discovery rules
+     (NETDIS-LLMNR-In, NETDIS-NB_*-In) for the active network profile.
+
+7.3  Self-scan (scanning the machine NetScan itself runs on)
+
+     From the Windows machine at, say, 192.168.1.50, run:
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 445
+                     --proto tcp --mode full --threads 30
+                     --discover --info
+
+     Find the line for 192.168.1.50 (the scanning machine's own IP) in
+     the results. Expect NetBIOS/LLMNR to still resolve a name for it -
+     this is the loopback-substitution behavior described in HELP.txt
+     section 5 ("Self-scanning"). If it comes back empty while a
+     neighboring machine's name resolves fine, that's worth reporting -
+     it would mean the loopback workaround regressed.
+
+7.4  SNMP sysDescr against real network gear
+
+     If you have anything with SNMP enabled (most routers/switches/UPS
+     units support it, sometimes off by default):
+
+     netscan_x64.exe --ip 192.168.1.1 --ports 161 --proto udp
+                     --mode full --threads 5 --info
+
+     Expect: "SNMP sysDescr: ..." with a real, readable device
+     description string.
+
+7.5  --sort-os groups the device list by OS guess
+
+     Re-run 7.1 with --sort-os added. Expect the "Device information"
+     block reordered so all TTL<=64 devices are together, then all
+     TTL<=128 (Windows) devices, rather than sorted by IP.
+
+
+================================================================================
+8. DEEPER HOSTNAME RESOLUTION (--deep-resolve)
+================================================================================
+
+8.1  SMB2/NTLMSSP handshake - the most reliable name source
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 445
+                     --proto tcp --mode full --threads 30
+                     --discover --deep-resolve
+
+     Expect: any Windows machine with SMB enabled (i.e. found on port
+     445) shows "SMB NetBIOS: имя=... домен=..." with its real computer
+     name and workgroup/domain. If the network has an actual AD domain,
+     also expect "SMB DNS: имя=... домен=..." with the real AD domain
+     name - this is the detail worth double-checking on a domain
+     network, since it was never validated against a real AD controller
+     during development.
+
+8.2  Reverse DNS via the gateway
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 445
+                     --proto tcp --mode full --threads 30
+                     --discover --deep-resolve
+
+     (same command as 8.1 covers this too) - check for "PTR (обратный
+     DNS): ..." lines. Whether these appear depends entirely on whether
+     your router/DHCP server registers client hostnames - a "no PTR
+     records at all" result can be completely normal on some routers.
+
+8.3  Reverse DNS via an explicit DNS server (e.g. an AD controller)
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 445
+                     --proto tcp --mode full --threads 30
+                     --discover --deep-resolve --dns-server 192.168.1.5
+
+     Use this on a domain network where the AD DNS server maintains a
+     fuller reverse zone than the router. Compare PTR results against
+     8.2's gateway-based lookup.
+
+
+================================================================================
+9. WMI HARDWARE/OS INVENTORY (--wmi)
+================================================================================
+
+Unlike every test above, --wmi requires real rights on the target
+machine. Expect it to fail (with a specific, readable error, not a
+crash or a hang) against anything you don't administer.
+
+9.1  SSO against your own machine or a domain you're already on
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135,445
+                     --proto tcp --mode full --threads 30
+                     --discover --wmi
+
+     Expect: for machines where your current session has WMI rights -
+     "WMI ОС:", "WMI загружена:", "WMI железо:", "WMI залогинен:" lines
+     with real, correct data. Cross-check core count/RAM/OS version
+     against Task Manager / System Properties on that machine directly.
+     For everything else: a clean "WMI: не удалось (...)" line, never a
+     silent gap or a crash.
+
+9.2  Explicit credentials
+
+     netscan_x64.exe --ip 192.168.1.50 --ports 135,445 --proto tcp
+                     --mode full --threads 5 --wmi
+                     --wmi-user someadmin --wmi-password ****
+                     --wmi-domain CORP
+
+     Expect: works the same as 9.1 but authenticates as the given
+     account instead of your current session - useful for scanning as
+     a service/admin account without changing who you're logged in as.
+
+9.3  Speed check: --wmi against a range with mostly non-Windows devices
+
+     netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135
+                     --proto tcp --mode full --threads 50
+                     --discover --wmi
+
+     Expect: this should NOT take minutes even though most devices
+     won't have DCOM open - confirms the port-135 pre-check (HELP.txt
+     section 7) is actually short-circuiting the slow ConnectServer
+     path for non-Windows/firewalled hosts. If this run is much slower
+     than 9.1, that's a regression worth reporting.
+
+9.4  --wmi-gpu
+
+     netscan_x64.exe --ip 192.168.1.50 --ports 135,445 --proto tcp
+                     --mode full --threads 5 --wmi --wmi-gpu
+
+     Expect: an additional "WMI видеоадаптер: ..." line with the real
+     GPU model, on top of everything from 9.1.
+
+
+================================================================================
+10. OUTPUT HANDLING
+================================================================================
+
+10.1  --resume + --when as a monitoring log
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.10 --ports 80,443
+                      --proto tcp --mode full --threads 10
+                      --out monitor.txt --resume --when
+
+      Run this command TWICE in a row. Expect: monitor.txt ends up with
+      two timestamped blocks separated by two blank lines, not
+      overwritten. Timestamps should be a few seconds apart and match
+      wall-clock time.
+
+10.2  --sort-by-port produces a second file without touching the first
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254
+                      --ports 22,80,443,3389 --proto tcp
+                      --mode fast --threads 50 --discover
+                      --out byip.txt --sort-by-port
+
+      Expect: both byip.txt (sorted by IP) and byip_by_port.txt (sorted
+      by port, then IP) exist and contain the same set of ip:port
+      pairs, just in different order. Diff the sorted contents of both
+      files (after sorting them identically) to confirm no results were
+      lost or duplicated between the two.
+
+
+================================================================================
+11. STARTUP / UX
+================================================================================
+
+11.1  Startup indicator appears immediately
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 1-1000
+                      --proto tcp --mode full --threads 10
+
+      Expect: "NetScan запущен, обрабатываю параметры..." appears the
+      instant the window opens, well before the first progress-bar
+      update - confirms the program isn't silently hanging at launch
+      (relevant if Windows Defender/SmartScreen adds its own delay
+      before the process even starts running).
+
+
+================================================================================
+NOTES FOR WHOEVER RUNS THIS
+================================================================================
+
+- Tests in sections 7-9 (--info / --deep-resolve / --wmi) were built
+  and unit-tested against simulated protocol responses during
+  development (hand-crafted NetBIOS/SNMP/mDNS/LLMNR/SMB2 servers), but
+  could NOT be validated end-to-end against a real Windows domain or a
+  live DCOM/WMI provider - there was no such environment available at
+  build time. Section 9 in particular (--wmi) is the least-tested path
+  in the whole tool. If anything in sections 7-9 misbehaves against
+  real infrastructure, that's expected to be where bugs surface first -
+  please report specifics (command used, expected vs actual output)
+  rather than just "it didn't work".
+- Always compare a new build's results against a known-good previous
+  run when in doubt - most of these tests are about catching
+  regressions, not proving correctness from a blank slate.
