@@ -174,6 +174,7 @@ typedef struct {
     int wmi_cpu_cores;
     double wmi_ram_gb;
     char wmi_logged_user[128];
+    char wmi_logon_time[32];
     char wmi_gpu[128];
     const char *device_guess;
 } HostInfo;
@@ -1711,6 +1712,17 @@ static void wmi_row_gpu(IWbemClassObject *obj, HostInfo *hi) {
     wmi_get_string_prop(obj, L"Name", hi->wmi_gpu, sizeof(hi->wmi_gpu));
 }
 
+/* Win32_LogonSession не хранит логин (это отдельный класс Win32_LoggedOnUser,
+   связанный через ассоциацию) - для нашей цели "когда залогинился текущий
+   интерактивный пользователь" достаточно взять StartTime самой свежей
+   интерактивной сессии (LogonType=2), без полного join. На рабочей станции
+   обычно ровно одна такая сессия. */
+static void wmi_row_logon_session(IWbemClassObject *obj, HostInfo *hi) {
+    char raw[64];
+    wmi_get_string_prop(obj, L"StartTime", raw, sizeof(raw));
+    format_wmi_datetime(raw, hi->wmi_logon_time, sizeof(hi->wmi_logon_time));
+}
+
 /* Основная точка входа: подключается к \\ip\root\cimv2 через DCOM и
    собирает ОС/железо/пользователя. При явных --wmi-user/--wmi-password
    аутентифицируется под ними, иначе - под текущим пользователем (SSO). */
@@ -1794,6 +1806,13 @@ static int wmi_query_host(uint32_t ip_h, HostInfo *hi) {
                                       L"FROM Win32_OperatingSystem", wmi_row_os, hi);
     int got_cs = wmi_run_query(pSvc, L"SELECT NumberOfLogicalProcessors,TotalPhysicalMemory,UserName "
                                       L"FROM Win32_ComputerSystem", wmi_row_computer_system, hi);
+    /* WQL не поддерживает ORDER BY - берём первую попавшуюся интерактивную
+       (LogonType=2) сессию. На обычной рабочей станции с одним залогиненным
+       пользователем это и есть искомое время логона; при нескольких
+       интерактивных сессиях (RDP и т.п.) результат может относиться к
+       любой из них - это приближение, а не гарантированно "самая свежая". */
+    wmi_run_query(pSvc, L"SELECT StartTime FROM Win32_LogonSession WHERE LogonType=2",
+                  wmi_row_logon_session, hi);
     if (g_wmi_gpu) {
         wmi_run_query(pSvc, L"SELECT Name FROM Win32_VideoController", wmi_row_gpu, hi);
     }
@@ -2047,6 +2066,10 @@ static void print_host_info_section(FILE *f) {
             if (hi->wmi_logged_user[0]) {
                 conprintf("  WMI залогинен: %s\n", hi->wmi_logged_user);
                 if (f) fprintf(f, "  WMI залогинен: %s\n", hi->wmi_logged_user);
+            }
+            if (hi->wmi_logon_time[0]) {
+                conprintf("  WMI время логона: %s\n", hi->wmi_logon_time);
+                if (f) fprintf(f, "  WMI время логона: %s\n", hi->wmi_logon_time);
             }
             if (hi->wmi_gpu[0]) {
                 conprintf("  WMI видеоадаптер: %s\n", hi->wmi_gpu);

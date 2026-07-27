@@ -448,6 +448,19 @@ don't administer.
       - Win32_ComputerSystem: logical CPU core count, total RAM, and the
         currently interactively logged-on user (UserName - empty if
         nobody is logged on locally).
+      - Win32_LogonSession (LogonType=2): an approximate logon time for
+        the current interactive session. WQL has no ORDER BY, so on a
+        machine with more than one interactive session (e.g. an RDP
+        session alongside the console) this picks whichever session the
+        provider happens to enumerate first, not necessarily the most
+        recent - treat it as a quick pointer, not an authoritative
+        answer, same spirit as the TTL-based OS guess elsewhere in this
+        tool. Logoff time is NOT available the same way: WMI only
+        exposes currently-active sessions, so there's nothing to query
+        once a session has ended - a real logoff time would need to be
+        mined from the Security event log (Win32_NTLogEvent, event ID
+        4634/4647), which requires the Security log to be remotely
+        readable and its auditing enabled - not implemented yet.
 
     Before attempting the (potentially slow) DCOM connection, the
     scanner first does its own quick TCP check against port 135 (the
@@ -597,14 +610,33 @@ Discussed but NOT YET IMPLEMENTED:
         model. Supports both SSO (current session) and explicit
         --wmi-user/--wmi-password/--wmi-domain credentials. DONE.
 
-  [ ] The same diagnostics via WinRM/PowerShell Remoting (port 5985/5986)
-        as an alternative transport to DCOM - needed for environments
-        where WinRM is enabled but classic DCOM (port 135 + a dynamic RPC
-        range) is blocked or disabled. wsman.h/IWSMan are available in
-        the toolchain; not yet implemented.
+  [ ] The same diagnostics via WinRM as an alternative transport to DCOM
+        - needed for environments where WinRM is enabled but classic
+        DCOM (port 135 + a dynamic RPC range) is blocked or disabled.
+        INVESTIGATED AND DEFERRED: mingw-w64's wsman.h only declares the
+        session-management calls (WSManInitialize/WSManCreateSession/
+        WSManCloseSession) plus the server-side WSManPlugin* API for
+        *writing* a WinRM plugin - it's missing every client-side
+        invoke/shell/get function (WSManCreateShell, WSManRunShellCommand,
+        WSManGetObject, etc.), and there's no import library for
+        wsmsvc.dll in the toolchain either. Hand-declaring those
+        functions and their structs from memory, with no real Windows
+        machine available to verify the ABI, was judged too risky (a
+        wrong struct layout wouldn't just fail to link - it could
+        misbehave against a real target). The realistic path forward is
+        a raw WS-Management SOAP-over-HTTP client built on WinINet
+        (already used for --update-oui), talking to port 5985/5986
+        directly and relying on WinINet's built-in NTLM/Negotiate
+        handling for auth - more work than the native API would have
+        been, but it doesn't depend on any header/library completeness.
+        Deferred in favor of other TODO items for now.
 
-  [ ] Further WMI-based fields once the above is validated against a
-        real domain: logon time and logoff time.
+  [x] Approximate interactive logon time via WMI (Win32_LogonSession).
+        DONE, with the caveat above about multiple sessions.
+
+  [ ] Logoff time - needs Security event log mining (Win32_NTLogEvent,
+        event ID 4634/4647) rather than a simple WMI class query; not
+        yet implemented.
 
   [ ] Idle time - AN IMPORTANT CAVEAT: this is the one metric that is
         fundamentally impossible to obtain remotely with standard
