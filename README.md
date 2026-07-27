@@ -8,8 +8,8 @@ Written in C, cross-compiled with mingw-w64 from Linux with static linking —
 no administrator rights, no third-party drivers (Npcap/WinPcap), and no
 extra `.dll` files needed on the target machine.
 
-Full documentation: [HELP.txt](HELP.txt)
-Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt)
+Full documentation: [HELP.txt](HELP.txt) ([Russian version](HELP.ru.txt))
+Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt) ([Russian version](HELP-tests.ru.txt))
 
 ## Features at a glance
 
