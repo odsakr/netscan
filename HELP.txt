@@ -638,13 +638,29 @@ Discussed but NOT YET IMPLEMENTED:
         event ID 4634/4647) rather than a simple WMI class query; not
         yet implemented.
 
-  [ ] Idle time - AN IMPORTANT CAVEAT: this is the one metric that is
-        fundamentally impossible to obtain remotely with standard
-        Windows tools. GetLastInputInfo() only works locally, on the
-        machine itself. Without a lightweight agent installed on each
-        machine that reports this value on request, it cannot be
-        obtained remotely at all - this is an architectural limitation
-        of Windows, not a matter of permissions.
+  [ ] Idle time - CORRECTION: an earlier version of this TODO claimed
+        this was fundamentally impossible to get remotely. That was
+        wrong, and conflated two different APIs. GetLastInputInfo() is
+        indeed local-only - but that's not what quser/qwinsta actually
+        use. They're built on the Terminal Services API (wtsapi32.dll):
+        WTSOpenServer(hostname) + WTSQuerySessionInformation(...,
+        WTSSessionInfo, ...) returns a WTSINFO struct with LastInputTime,
+        LogonTime, ConnectTime, and DisconnectTime all in one call - and
+        it works remotely, exactly like quser /server:hostname does.
+        Both the header and the import library (libwtsapi32.a) are
+        present in the mingw-w64 toolchain, unlike the WinRM situation
+        above - no ABI-guessing risk here. This turns both the logon-time
+        TODO item above and the deferred logoff-time item into something
+        answerable via a single, well-supported API, likely replacing
+        the WMI Win32_LogonSession approach entirely. Not yet
+        implemented, but no longer blocked - next in line.
+
+  [ ] Task Scheduler (ITaskService, COM/DCOM, taskschd.h) as a general
+        "run something once on the target and collect the result"
+        channel - both header and import library (libtaskschd.a) are
+        present in the toolchain. Useful beyond idle time: a way to run
+        a one-shot remote command and retrieve its output without a
+        permanently installed agent. Not yet implemented.
 
   [ ] Remote configuration via registry/WMI-DCOM:
         enabling the necessary firewall rules (Network Discovery,
