@@ -381,7 +381,66 @@ crash or a hang) against anything you don't administer.
 
 
 ================================================================================
-10. OUTPUT HANDLING
+10. IDLE TIME / LOGON TIME VIA TERMINAL SERVICES (--wts)
+================================================================================
+
+Same rights requirement as section 9 - expect a clean, specific error
+against anything you don't administer, never a crash or hang.
+
+10.1  SSO against a machine you're already logged into / a domain
+      you're already on
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135
+                      --proto tcp --mode full --threads 30
+                      --discover --wts
+
+      Expect: "WTS сессия: DOMAIN\user", "WTS время логона: ...", and
+      "WTS бездействие: N.N мин." for machines with an active
+      interactive session your current session can query. Cross-check
+      the idle minutes against reality (step away from the target
+      machine for a known amount of time, then re-run and compare).
+      For everything else: a clean "WTS: не удалось (...)" line.
+
+10.2  Explicit credentials (reuses --wmi-user/--wmi-password/--wmi-domain)
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5 --wts
+                      --wmi-user someadmin --wmi-password ****
+                      --wmi-domain CORP
+
+      Expect: works the same as 10.1 but authenticates as the given
+      account. This is the one path in the whole tool that was hardest
+      to validate without a real domain controller - LogonUserW with
+      LOGON32_LOGON_NEW_CREDENTIALS behaves differently across Windows
+      versions and domain-trust configurations in ways a sandboxed test
+      environment can't reproduce. If this specifically misbehaves
+      (works for 10.1 but not 10.2), that's the most likely place for a
+      real bug to surface.
+
+10.3  --wts and --wmi together in one run
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135,445
+                      --proto tcp --mode full --threads 30
+                      --discover --wts --wmi
+
+      Expect: both sets of fields appear for the same host (WMI's
+      hardware/OS block plus WTS's session block) - confirms the two
+      independent code paths don't interfere with each other when
+      combined, and that credentials are shared correctly between them.
+
+10.4  Speed check, same reasoning as WMI's 9.3
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135
+                      --proto tcp --mode full --threads 50
+                      --discover --wts
+
+      Expect: fast rejection for non-Windows/firewalled hosts, same as
+      9.3 - confirms --wts's own port-135 pre-check is working, not
+      just --wmi's.
+
+
+================================================================================
+11. OUTPUT HANDLING
 ================================================================================
 
 10.1  --resume + --when as a monitoring log
@@ -410,7 +469,7 @@ crash or a hang) against anything you don't administer.
 
 
 ================================================================================
-11. STARTUP / UX
+12. STARTUP / UX
 ================================================================================
 
 11.1  Startup indicator appears immediately
@@ -429,16 +488,24 @@ crash or a hang) against anything you don't administer.
 NOTES FOR WHOEVER RUNS THIS
 ================================================================================
 
-- Tests in sections 7-9 (--info / --deep-resolve / --wmi) were built
-  and unit-tested against simulated protocol responses during
+- Tests in sections 7-10 (--info / --deep-resolve / --wmi / --wts) were
+  built and unit-tested against simulated protocol responses during
   development (hand-crafted NetBIOS/SNMP/mDNS/LLMNR/SMB2 servers), but
-  could NOT be validated end-to-end against a real Windows domain or a
-  live DCOM/WMI provider - there was no such environment available at
-  build time. Section 9 in particular (--wmi) is the least-tested path
-  in the whole tool. If anything in sections 7-9 misbehaves against
-  real infrastructure, that's expected to be where bugs surface first -
-  please report specifics (command used, expected vs actual output)
-  rather than just "it didn't work".
+  could NOT be validated end-to-end against a real Windows domain, a
+  live DCOM/WMI provider, or a real Terminal Services host - there was
+  no such environment available at build time. Sections 9 and 10 in
+  particular (--wmi and --wts) are the least-tested paths in the whole
+  tool - both were only confirmed to fail cleanly (no crash, no hang,
+  a specific readable error) against closed ports and fake listeners
+  under Wine, never confirmed to succeed against a real target.
+  Test 10.2 (--wts with explicit credentials) is the single hardest
+  path to have validated in a sandbox - LogonUserW's behavior with
+  LOGON32_LOGON_NEW_CREDENTIALS genuinely depends on the target
+  domain's trust configuration in ways that can't be simulated. If
+  anything in sections 7-10 misbehaves against real infrastructure,
+  that's expected to be where bugs surface first - please report
+  specifics (command used, expected vs actual output) rather than just
+  "it didn't work".
 - Always compare a new build's results against a known-good previous
   run when in doubt - most of these tests are about catching
   regressions, not proving correctness from a blank slate.

@@ -22,6 +22,7 @@
 #define COBJMACROS
 #include <objbase.h>
 #include <wbemidl.h>
+#include <wtsapi32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 /* ---------------------------------------------------------------------- */
 /* Общие структуры                                                        */
@@ -129,6 +131,15 @@ static char g_wmi_user[128] = ""; /* --wmi-user: пусто = текущий п�
 static char g_wmi_password[128] = "";
 static char g_wmi_domain[128] = ""; /* --wmi-domain: опционально, для user -> DOMAIN\user */
 static int g_wmi_com_ready = 0;   /* CoInitializeSecurity выполнен успешно в главном потоке */
+
+/* ---------------------------------------------------------------------- */
+/* WTS (Terminal Services API, --wts): то же самое, что делает            */
+/* штатный quser/qwinsta - логон/бездействие/сессия удалённого хоста.     */
+/* Использует ТЕ ЖЕ учётные данные --wmi-user/--wmi-password/--wmi-domain */
+/* (пусто = текущая сессия, SSO), т.к. концептуально это тот же класс     */
+/* "требует прав" диагностики, что и --wmi, просто другой API/транспорт.  */
+/* ---------------------------------------------------------------------- */
+static int g_wts_mode = 0;
 static int g_update_oui_only = 0;   /* --update-oui: только скачать базу OUI и выйти */
 #define OUI_URL "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes"
 
@@ -176,6 +187,13 @@ typedef struct {
     char wmi_logged_user[128];
     char wmi_logon_time[32];
     char wmi_gpu[128];
+    int has_wts;
+    char wts_error[160];
+    char wts_username[64];
+    char wts_domain[64];
+    char wts_logon_time[32];
+    char wts_connect_time[32];
+    double wts_idle_minutes; /* -1 = неизвестно */
     const char *device_guess;
 } HostInfo;
 
@@ -1829,6 +1847,127 @@ static int wmi_query_host(uint32_t ip_h, HostInfo *hi) {
     return 1;
 }
 
+/* ---------------------------------------------------------------------- */
+/* WTS (Terminal Services API) - то, на чём построены сами quser/qwinsta. */
+/* WTSQuerySessionInformation с классом WTSSessionInfo отдаёт разом        */
+/* LogonTime, LastInputTime (=бездействие), ConnectTime, DisconnectTime,   */
+/* имя и домен пользователя - причём удалённо, как quser /server:host.    */
+/* ---------------------------------------------------------------------- */
+
+/* LARGE_INTEGER здесь - это FILETIME (100-нс интервалы с 1601 года),
+   просто представленный как 64-битное целое, а не структура FILETIME. */
+static void filetime_large_to_str(LARGE_INTEGER li, char *out, size_t cap) {
+    out[0] = 0;
+    if (li.QuadPart == 0) return; /* поле не заполнено (нет значения) */
+
+    FILETIME ft;
+    ft.dwLowDateTime = li.LowPart;
+    ft.dwHighDateTime = (DWORD)li.HighPart;
+
+    FILETIME local_ft;
+    SYSTEMTIME st;
+    if (FileTimeToLocalFileTime(&ft, &local_ft) && FileTimeToSystemTime(&local_ft, &st)) {
+        snprintf(out, cap, "%02d.%02d.%04d %02d:%02d:%02d",
+                 st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+    }
+}
+
+/* Разница между LastInputTime и CurrentTime в минутах - то самое "IDLE
+   TIME" из quser, просто в явном числовом виде вместо "5+03:12" формата. */
+static double filetime_idle_minutes(LARGE_INTEGER current, LARGE_INTEGER last_input) {
+    if (last_input.QuadPart == 0 || current.QuadPart <= last_input.QuadPart) return -1.0;
+    ULONGLONG diff_100ns = (ULONGLONG)(current.QuadPart - last_input.QuadPart);
+    return (double)diff_100ns / (10000000.0 * 60.0);
+}
+
+static int wts_query_host(uint32_t ip_h, HostInfo *hi) {
+    char ipstr[64];
+    u32_to_ip_str(ip_h, ipstr, sizeof(ipstr));
+    wchar_t wip[64];
+    ascii_to_wide(ipstr, wip, sizeof(wip) / sizeof(wchar_t));
+
+    /* та же быстрая предпроверка порта 135, что и для --wmi: WTSOpenServer
+       сам по себе не даёт настроить таймаут и опирается на тот же RPC-
+       транспорт, что и DCOM - на недоступном хосте может тянуться долго. */
+    if (!tcp_check(ip_h, 135, 700)) {
+        snprintf(hi->wts_error, sizeof(hi->wts_error), "порт 135 (RPC) недоступен");
+        return 0;
+    }
+
+    HANDLE hImpToken = NULL;
+    int impersonating = 0;
+    if (g_wmi_user[0]) {
+        wchar_t wuser[128], wdomain[128], wpass[128];
+        ascii_to_wide(g_wmi_user, wuser, 128);
+        ascii_to_wide(g_wmi_password, wpass, 128);
+        wcscpy(wdomain, g_wmi_domain[0] ? L"" : L".");
+        if (g_wmi_domain[0]) ascii_to_wide(g_wmi_domain, wdomain, 128);
+
+        /* LOGON32_LOGON_NEW_CREDENTIALS = "как runas /netonly" - учётные
+           данные подставляются только для исходящих сетевых обращений,
+           без локальной проверки пароля (его и нельзя проверить локально
+           для доменной учётки без связи с контроллером домена). Ровно то,
+           что нужно для сканера, обращающегося к чужим машинам. */
+        if (!LogonUserW(wuser, wdomain, wpass, LOGON32_LOGON_NEW_CREDENTIALS,
+                         LOGON32_PROVIDER_WINNT50, &hImpToken)) {
+            snprintf(hi->wts_error, sizeof(hi->wts_error), "LogonUser: 0x%08lX", GetLastError());
+            return 0;
+        }
+        if (!ImpersonateLoggedOnUser(hImpToken)) {
+            snprintf(hi->wts_error, sizeof(hi->wts_error), "ImpersonateLoggedOnUser: 0x%08lX", GetLastError());
+            CloseHandle(hImpToken);
+            return 0;
+        }
+        impersonating = 1;
+    }
+
+    int found = 0;
+    HANDLE hServer = WTSOpenServerW(wip);
+    if (hServer) {
+        PWTS_SESSION_INFOW pSessions = NULL;
+        DWORD count = 0;
+        if (WTSEnumerateSessionsW(hServer, 0, 1, &pSessions, &count)) {
+            for (DWORD i = 0; i < count && !found; i++) {
+                if (pSessions[i].State != WTSActive) continue; /* нас интересует активная сессия */
+
+                LPWSTR buf = NULL;
+                DWORD bytes = 0;
+                if (WTSQuerySessionInformationW(hServer, pSessions[i].SessionId, WTSSessionInfo,
+                                                 &buf, &bytes) && buf && bytes >= sizeof(WTSINFOW)) {
+                    WTSINFOW *info = (WTSINFOW *)buf;
+                    hi->wts_username[0] = 0;
+                    WideCharToMultiByte(CP_UTF8, 0, info->UserName, -1,
+                                         hi->wts_username, (int)sizeof(hi->wts_username), NULL, NULL);
+                    WideCharToMultiByte(CP_UTF8, 0, info->Domain, -1,
+                                         hi->wts_domain, (int)sizeof(hi->wts_domain), NULL, NULL);
+                    filetime_large_to_str(info->LogonTime, hi->wts_logon_time, sizeof(hi->wts_logon_time));
+                    filetime_large_to_str(info->ConnectTime, hi->wts_connect_time, sizeof(hi->wts_connect_time));
+                    hi->wts_idle_minutes = filetime_idle_minutes(info->CurrentTime, info->LastInputTime);
+                    found = 1;
+                    WTSFreeMemory(buf);
+                }
+            }
+            WTSFreeMemory(pSessions);
+        } else {
+            snprintf(hi->wts_error, sizeof(hi->wts_error), "WTSEnumerateSessions: 0x%08lX", GetLastError());
+        }
+        WTSCloseServer(hServer);
+    } else {
+        snprintf(hi->wts_error, sizeof(hi->wts_error), "WTSOpenServer: 0x%08lX", GetLastError());
+    }
+
+    if (impersonating) {
+        RevertToSelf();
+        CloseHandle(hImpToken);
+    }
+
+    if (found) hi->has_wts = 1;
+    else if (hi->wts_error[0] == 0) {
+        snprintf(hi->wts_error, sizeof(hi->wts_error), "нет активных интерактивных сессий");
+    }
+    return found;
+}
+
 static void gather_host_info(HostInfo *hi) {
     if (!hi->has_ttl) {
         int ttl;
@@ -1880,6 +2019,11 @@ static void gather_host_info(HostInfo *hi) {
 
     if (g_wmi_mode) {
         wmi_query_host(hi->ip, hi);
+    }
+
+    if (g_wts_mode) {
+        hi->wts_idle_minutes = -1.0;
+        wts_query_host(hi->ip, hi);
     }
 
     hi->device_guess = guess_device_by_ports(hi->ip);
@@ -2078,6 +2222,23 @@ static void print_host_info_section(FILE *f) {
         } else if (g_wmi_mode && hi->wmi_error[0]) {
             conprintf("  WMI: не удалось (%s)\n", hi->wmi_error);
             if (f) fprintf(f, "  WMI: не удалось (%s)\n", hi->wmi_error);
+        }
+        if (hi->has_wts) {
+            if (hi->wts_username[0]) {
+                conprintf("  WTS сессия: %s\\%s\n", hi->wts_domain, hi->wts_username);
+                if (f) fprintf(f, "  WTS сессия: %s\\%s\n", hi->wts_domain, hi->wts_username);
+            }
+            if (hi->wts_logon_time[0]) {
+                conprintf("  WTS время логона: %s\n", hi->wts_logon_time);
+                if (f) fprintf(f, "  WTS время логона: %s\n", hi->wts_logon_time);
+            }
+            if (hi->wts_idle_minutes >= 0) {
+                conprintf("  WTS бездействие: %.1f мин.\n", hi->wts_idle_minutes);
+                if (f) fprintf(f, "  WTS бездействие: %.1f мин.\n", hi->wts_idle_minutes);
+            }
+        } else if (g_wts_mode && hi->wts_error[0]) {
+            conprintf("  WTS: не удалось (%s)\n", hi->wts_error);
+            if (f) fprintf(f, "  WTS: не удалось (%s)\n", hi->wts_error);
         }
     }
 }
@@ -2668,6 +2829,10 @@ static void print_usage(const char *prog) {
         "  --wmi-password P пароль для WMI (используется вместе с --wmi-user).\n"
         "  --wmi-domain D   домен для --wmi-user (опционально, для DOMAIN\\user).\n"
         "  --wmi-gpu        дополнительно запросить через WMI модель видеоадаптера.\n"
+        "  --wts            запросить через Terminal Services API (то же, что делают\n"
+        "                    штатные quser/qwinsta): текущего пользователя сессии, время\n"
+        "                    логона, время бездействия. Использует ТЕ ЖЕ --wmi-user/\n"
+        "                    --wmi-password/--wmi-domain, что и --wmi. Включает --info.\n"
         "  --sort-by-port   доп. файл result_by_port.txt с теми же результатами, но\n"
         "                   отсортированными по порту (основной файл по IP не меняется -\n"
         "                   сохраняются оба варианта одновременно).\n"
@@ -2737,6 +2902,9 @@ int main(int argc, char **argv) {
             strncpy(g_wmi_password, argv[++i], sizeof(g_wmi_password) - 1);
         } else if (strcmp(argv[i], "--wmi-domain") == 0 && i + 1 < argc) {
             strncpy(g_wmi_domain, argv[++i], sizeof(g_wmi_domain) - 1);
+        } else if (strcmp(argv[i], "--wts") == 0) {
+            g_wts_mode = 1;
+            g_info_mode = 1; /* --wts подразумевает --info */
         } else if (strcmp(argv[i], "--sort-by-port") == 0) {
             g_sort_by_port_also = 1;
         } else if (strcmp(argv[i], "--sort-os") == 0) {

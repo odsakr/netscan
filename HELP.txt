@@ -181,6 +181,20 @@ USAGE EXAMPLES
     instead of explicit credentials.
 
 
+12) Who's idle and for how long, across a whole subnet:
+
+    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135
+                    --proto tcp --discover --wts
+                    --wmi-user admin --wmi-password ****
+                    --wmi-domain CORP --mode full --threads 30
+
+    Same rights requirement as --wmi (in fact reuses the very same
+    credential flags). This is the "who's actually working right now"
+    report - the same data quser/qwinsta would show you one machine at
+    a time, gathered across an entire range in one pass. Combine with
+    --wmi in the same run if you also want hardware/OS details.
+
+
 FULL FEATURE REFERENCE
 ================================================================================
 
@@ -496,6 +510,44 @@ don't administer.
     hardware planning rather than a core diagnostic, and it's one more
     WMI round-trip per host.
 
+--wts
+    Turns on --info automatically. Queries the Terminal Services API
+    (wtsapi32.dll) - the exact same API quser/qwinsta are built on top
+    of, and it works remotely the same way `quser /server:hostname`
+    does: WTSOpenServerW(host) + WTSEnumerateSessionsW to find the
+    active interactive session, then WTSQuerySessionInformationW with
+    WTSSessionInfo returns a WTSINFOW struct containing the session's
+    username/domain, LogonTime, ConnectTime, and LastInputTime - all in
+    a single call. Idle time is computed as CurrentTime - LastInputTime
+    from that same struct (the literal "IDLE TIME" column in quser).
+    An earlier version of this tool's TODO claimed idle time was
+    impossible to get remotely - that was wrong, and conflated
+    GetLastInputInfo() (genuinely local-only) with this API (which is
+    specifically designed for remote session queries).
+
+    Uses the SAME credentials as --wmi (--wmi-user/--wmi-password/
+    --wmi-domain) - conceptually this is the same class of
+    rights-dependent diagnostic, just a different API/transport, so
+    there was no reason to introduce a second set of flags. With no
+    credentials given, the current session is used (SSO). With
+    credentials given, they're applied via LogonUserW with
+    LOGON32_LOGON_NEW_CREDENTIALS (the same approach `runas /netonly`
+    uses - the credentials are only used for outbound network auth, not
+    validated locally, which is exactly right for a scanning tool
+    reaching into a domain it isn't joined to) plus
+    ImpersonateLoggedOnUser for the duration of the query.
+
+    Like --wmi, this relies on the same RPC transport as classic DCOM,
+    so the same fast pre-check of TCP port 135 is done first, for the
+    same reason (WTSOpenServer has no configurable timeout and can
+    otherwise stall for the OS's default RPC timeout against an
+    unreachable host).
+
+    Only the active session is reported currently; a host with only
+    disconnected sessions (State != WTSActive) shows "no active
+    interactive sessions" rather than stale data from a disconnected
+    one.
+
 --------------------------------------------------------------------------
 8. OUTPUT AND SAVING RESULTS
 --------------------------------------------------------------------------
@@ -528,6 +580,15 @@ don't administer.
           PTR (reverse DNS): ...           (only with --deep-resolve)
           SMB NetBIOS: name=... domain=... (only with --deep-resolve)
           SMB DNS: name=... domain=...     (only with --deep-resolve)
+          WMI ОС/OS: ...                    (only with --wmi)
+          WMI booted: ...
+          WMI hardware: N cores, N.N GB RAM
+          WMI logged on: ...
+          WMI logon time: ...
+          WMI GPU: ...                      (only with --wmi-gpu)
+          WTS session: ...                  (only with --wts)
+          WTS logon time: ...
+          WTS idle: N.N min.
         ******************************************************************
         ip
           ...
@@ -638,22 +699,25 @@ Discussed but NOT YET IMPLEMENTED:
         event ID 4634/4647) rather than a simple WMI class query; not
         yet implemented.
 
-  [ ] Idle time - CORRECTION: an earlier version of this TODO claimed
-        this was fundamentally impossible to get remotely. That was
-        wrong, and conflated two different APIs. GetLastInputInfo() is
-        indeed local-only - but that's not what quser/qwinsta actually
-        use. They're built on the Terminal Services API (wtsapi32.dll):
-        WTSOpenServer(hostname) + WTSQuerySessionInformation(...,
-        WTSSessionInfo, ...) returns a WTSINFO struct with LastInputTime,
-        LogonTime, ConnectTime, and DisconnectTime all in one call - and
-        it works remotely, exactly like quser /server:hostname does.
-        Both the header and the import library (libwtsapi32.a) are
-        present in the mingw-w64 toolchain, unlike the WinRM situation
-        above - no ABI-guessing risk here. This turns both the logon-time
-        TODO item above and the deferred logoff-time item into something
-        answerable via a single, well-supported API, likely replacing
-        the WMI Win32_LogonSession approach entirely. Not yet
-        implemented, but no longer blocked - next in line.
+  [x] Idle time, logon time, and current session user via the Terminal
+        Services API (--wts): WTSOpenServer + WTSQuerySessionInformation
+        (WTSSessionInfo) - the same API quser/qwinsta are built on. An
+        earlier version of this TODO wrongly claimed idle time was
+        impossible to get remotely (conflating it with the genuinely
+        local-only GetLastInputInfo()). DONE - reuses --wmi-user/
+        --wmi-password/--wmi-domain for credentials (LogonUserW with
+        LOGON32_LOGON_NEW_CREDENTIALS + ImpersonateLoggedOnUser), same
+        port-135 pre-check as --wmi to avoid RPC-timeout stalls. Only
+        tested against simulated/closed ports so far (no real domain
+        available) - see HELP-tests.txt for the real-world validation
+        checklist.
+
+  [ ] Logoff time specifically (as opposed to logon time/idle time,
+        both now covered by --wts above) still isn't directly queryable
+        - WTS only reports currently active/disconnected sessions, not
+        a history of past logoffs. Would still need Security event log
+        mining (Win32_NTLogEvent, event ID 4634/4647) for that specific
+        piece.
 
   [ ] Task Scheduler (ITaskService, COM/DCOM, taskschd.h) as a general
         "run something once on the target and collect the result"
@@ -687,5 +751,6 @@ Discussed but NOT YET IMPLEMENTED:
 ================================================================================
 Built via mingw-w64 cross-compilation (x86_64-w64-mingw32-gcc /
 i686-w64-mingw32-gcc), statically linked (-static -static-libgcc),
-linked against ws2_32, iphlpapi, wininet, ole32, oleaut32, wbemuuid.
+linked against ws2_32, iphlpapi, wininet, ole32, oleaut32, wbemuuid,
+wtsapi32.
 ================================================================================
