@@ -33,6 +33,10 @@ Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt)
 - Idle time and logon time via the Terminal Services API (`--wts`) —
   the same data `quser`/`qwinsta` show, gathered across a whole subnet
   in one pass; reuses the same credentials as `--wmi`
+- Fail-safe remote execution via Task Scheduler (`--remote-exec`,
+  `--enable-discovery`) — runs a command locally on the target as
+  SYSTEM, so it isn't blocked by whatever network restriction might
+  stop a direct registry/service RPC call
 - Flexible output: append mode with timestamps, simultaneous sort-by-IP
   and sort-by-port result files
 
@@ -49,10 +53,10 @@ Build it yourself:
 
 ```
 x86_64-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x64.exe \
-    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -static -static-libgcc
+    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -ltaskschd -static -static-libgcc
 
 i686-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o netscan_x86.exe \
-    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -static -static-libgcc
+    -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -ltaskschd -static -static-libgcc
 ```
 
 ## Why not just use nmap?

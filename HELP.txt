@@ -195,6 +195,22 @@ USAGE EXAMPLES
     --wmi in the same run if you also want hardware/OS details.
 
 
+13) Fixing NetBIOS/LLMNR across a whole domain in one pass, so the
+    --info diagnostics above actually work everywhere:
+
+    netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135
+                    --proto tcp --discover --enable-discovery
+                    --wmi-user admin --wmi-password ****
+                    --wmi-domain CORP --mode full --threads 20
+
+    Runs on every reachable machine via Task Scheduler (fail-safe -
+    executes locally on the target as SYSTEM, so it isn't blocked by
+    whatever network restriction might be stopping a direct remote-
+    registry/service-control call). Follow up with a normal --info or
+    --deep-resolve scan afterward to confirm NetBIOS/LLMNR now actually
+    answer on the machines that were silent before.
+
+
 FULL FEATURE REFERENCE
 ================================================================================
 
@@ -548,6 +564,47 @@ don't administer.
     interactive sessions" rather than stale data from a disconnected
     one.
 
+--remote-exec CMD
+    Runs an arbitrary command on every target via Task Scheduler
+    (ITaskService, COM/DCOM) - a fail-safe execution channel: after
+    registration, the task runs LOCALLY on the target under SYSTEM, so
+    it doesn't trip over the same network-level restrictions that could
+    block a direct RPC call to the registry or a service. Concretely:
+    ITaskService::Connect(host, user, domain, password) - same
+    credentials as --wmi/--wts - then a new task is created with a
+    SYSTEM principal (TASK_LOGON_SERVICE_ACCOUNT, TASK_RUNLEVEL_HIGHEST),
+    a single ExecAction (cmd.exe /c <your command>), registered under
+    TASK_CREATE_OR_UPDATE, run immediately via IRegisteredTask::Run, and
+    polled every 300ms until it stops running or --remote-exec-timeout
+    is reached. The task is deleted from the target afterward regardless
+    of outcome - nothing is left behind. Currently reports only the
+    task's exit code, not captured stdout/stderr - redirect output to a
+    file on the target yourself (e.g. `... > C:\Windows\Temp\out.txt`)
+    if you need to inspect it afterward.
+
+    Same TCP-135 pre-check as --wmi/--wts, for the same reason (no
+    configurable connect timeout otherwise).
+
+--remote-exec-timeout N (milliseconds, default 15000)
+    How long to wait for the remote task to finish before giving up.
+
+--enable-discovery
+    A canned --remote-exec script that turns on Network Discovery/
+    NetBIOS/LLMNR: `Get-NetFirewallRule | Where-Object {$_.Name -like
+    'NETDIS*'} | Enable-NetFirewallRule`, plus a best-effort attempt to
+    set FDResPub/fdPHost/SSDPSRV/upnphost to Automatic and start them
+    (each wrapped in -ErrorAction SilentlyContinue, so a missing service
+    doesn't abort the rest). The firewall-rule part matches exactly what
+    was manually verified to work during this tool's own development,
+    when tracking down why a Windows machine wasn't answering
+    NetBIOS/LLMNR queries (see the git history/commit messages around
+    that point) - filtering by the rule's Name (always "NETDIS-...")
+    rather than its DisplayGroup, since DisplayGroup text is localized
+    ("Обнаружение сети" on a Russian system, "Network Discovery" on an
+    English one) and Name is not. Mutually exclusive with --remote-exec
+    in practice - if both are given, --enable-discovery's canned script
+    takes priority.
+
 --------------------------------------------------------------------------
 8. OUTPUT AND SAVING RESULTS
 --------------------------------------------------------------------------
@@ -589,6 +646,7 @@ don't administer.
           WTS session: ...                  (only with --wts)
           WTS logon time: ...
           WTS idle: N.N min.
+          Remote-exec: done, exit code N     (only with --remote-exec/--enable-discovery)
         ******************************************************************
         ip
           ...
@@ -719,20 +777,29 @@ Discussed but NOT YET IMPLEMENTED:
         mining (Win32_NTLogEvent, event ID 4634/4647) for that specific
         piece.
 
-  [ ] Task Scheduler (ITaskService, COM/DCOM, taskschd.h) as a general
+  [x] Task Scheduler (ITaskService, COM/DCOM, taskschd.h) as a general
         "run something once on the target and collect the result"
-        channel - both header and import library (libtaskschd.a) are
-        present in the toolchain. Useful beyond idle time: a way to run
-        a one-shot remote command and retrieve its output without a
-        permanently installed agent. Not yet implemented.
+        channel (--remote-exec). DONE - registers a SYSTEM-principal task
+        running cmd.exe /c <command>, runs it immediately, polls for
+        completion, deletes it afterward regardless of outcome. Only
+        the exit code is reported, not captured stdout/stderr yet.
 
-  [ ] Remote configuration via registry/WMI-DCOM:
-        enabling the necessary firewall rules (Network Discovery,
-        NetBIOS, LLMNR), enabling "Network Discovery", NetBIOS over
-        TCP/IP, etc. - without this, many pieces of information from the
-        larger WMI layer simply won't be available on "unconfigured"
-        domain machines. Implemented via the same DCOM/remote-registry
-        layer.
+  [x] Remote configuration, specifically enabling Network
+        Discovery/NetBIOS/LLMNR firewall rules (--enable-discovery).
+        DONE, built on --remote-exec above rather than direct
+        registry/WMI-DCOM writes - the fail-safe angle discussed when
+        this was planned turned out to be the simplest correct answer:
+        since Task Scheduler already gives arbitrary local execution as
+        SYSTEM on the target, there was no separate benefit to also
+        implementing narrower direct-registry/service-control code
+        paths that would just be trying to reach the same result through
+        a more fragile, more restriction-prone route. If a genuine need
+        for surgical remote-registry access (rather than "run a script")
+        shows up later, that would be a separate, narrower addition.
+        Only covers Network Discovery/NetBIOS/LLMNR for now - doesn't
+        yet touch things like NetBIOS-over-TCP/IP's per-adapter registry
+        setting or other domain-hardening-related toggles a real
+        deployment might also need.
 
   [ ] A GUI version built on top of the already-working console core.
 
@@ -752,5 +819,5 @@ Discussed but NOT YET IMPLEMENTED:
 Built via mingw-w64 cross-compilation (x86_64-w64-mingw32-gcc /
 i686-w64-mingw32-gcc), statically linked (-static -static-libgcc),
 linked against ws2_32, iphlpapi, wininet, ole32, oleaut32, wbemuuid,
-wtsapi32.
+wtsapi32, taskschd.
 ================================================================================

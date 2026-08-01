@@ -440,7 +440,87 @@ against anything you don't administer, never a crash or hang.
 
 
 ================================================================================
-11. OUTPUT HANDLING
+11. REMOTE EXECUTION VIA TASK SCHEDULER (--remote-exec / --enable-discovery)
+================================================================================
+
+Same rights requirement as sections 9-10, same credential flags. This
+is the one section that writes/executes on the target rather than only
+reading from it - be a bit more deliberate about which range you point
+it at.
+
+11.1  A harmless read-only command as a first smoke test
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "whoami > C:\Windows\Temp\netscan_test.txt"
+                      --remote-exec-timeout 10000
+
+      Expect: "Remote-exec: выполнено, код возврата 0". Confirm on the
+      target machine afterward that C:\Windows\Temp\netscan_test.txt
+      was actually created and contains the SYSTEM account name (since
+      the task runs as SYSTEM, not as whichever account you authenticated
+      with) - this is the current way to inspect output, since exit-code
+      only is reported directly by the tool (see HELP.txt section 7).
+
+11.2  Explicit credentials
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "whoami /all > C:\Windows\Temp\netscan_test2.txt"
+                      --wmi-user someadmin --wmi-password ****
+                      --wmi-domain CORP
+
+      Expect: same as 11.1, authenticating as the given account instead
+      of the current session.
+
+11.3  --enable-discovery against a machine with NetBIOS/LLMNR currently
+      not answering
+
+      First, confirm the "before" state with a normal --info scan
+      against the target (see section 7). Then:
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5 --enable-discovery
+
+      Expect: "Remote-exec: выполнено, код возврата 0" (PowerShell
+      returning 0 doesn't guarantee every sub-command inside succeeded
+      individually, since service-related ones are wrapped in
+      -ErrorAction SilentlyContinue - check the target's actual firewall
+      rule state directly with `Get-NetFirewallRule | Where-Object
+      {$_.Name -like "NETDIS*"} | Select DisplayName,Enabled` if you want
+      to confirm precisely). Then re-run the --info scan from before -
+      NetBIOS/LLMNR should now answer where they didn't.
+
+11.4  Timeout handling for a slow or hanging remote command
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "timeout /t 30" --remote-exec-timeout 3000
+
+      Expect: the tool gives up politely after ~3 seconds ("не удалось
+      получить результат задачи") rather than blocking for the full 30
+      seconds the remote command would actually take - confirms the
+      polling loop respects --remote-exec-timeout. The task itself may
+      still be left running on the target until it finishes on its own
+      in this specific case (the tool doesn't attempt to force-kill an
+      already-started task it gave up waiting on) - worth being aware of
+      if you set a --remote-exec-timeout much shorter than the command
+      you're actually asking it to run.
+
+11.5  Combine with --wmi and --wts in one pass
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 135,445
+                      --proto tcp --discover --wmi --wts --enable-discovery
+                      --mode full --threads 20
+
+      Expect: all three independent blocks (WMI hardware/OS, WTS
+      session, Remote-exec result) appear for the same host without
+      interfering with each other - confirms the shared COM
+      initialization across all three code paths is correct.
+
+
+================================================================================
+12. OUTPUT HANDLING
 ================================================================================
 
 10.1  --resume + --when as a monitoring log
@@ -469,7 +549,7 @@ against anything you don't administer, never a crash or hang.
 
 
 ================================================================================
-12. STARTUP / UX
+13. STARTUP / UX
 ================================================================================
 
 11.1  Startup indicator appears immediately
@@ -488,21 +568,30 @@ against anything you don't administer, never a crash or hang.
 NOTES FOR WHOEVER RUNS THIS
 ================================================================================
 
-- Tests in sections 7-10 (--info / --deep-resolve / --wmi / --wts) were
-  built and unit-tested against simulated protocol responses during
-  development (hand-crafted NetBIOS/SNMP/mDNS/LLMNR/SMB2 servers), but
-  could NOT be validated end-to-end against a real Windows domain, a
-  live DCOM/WMI provider, or a real Terminal Services host - there was
-  no such environment available at build time. Sections 9 and 10 in
-  particular (--wmi and --wts) are the least-tested paths in the whole
-  tool - both were only confirmed to fail cleanly (no crash, no hang,
-  a specific readable error) against closed ports and fake listeners
-  under Wine, never confirmed to succeed against a real target.
-  Test 10.2 (--wts with explicit credentials) is the single hardest
-  path to have validated in a sandbox - LogonUserW's behavior with
-  LOGON32_LOGON_NEW_CREDENTIALS genuinely depends on the target
-  domain's trust configuration in ways that can't be simulated. If
-  anything in sections 7-10 misbehaves against real infrastructure,
+- Tests in sections 7-11 (--info / --deep-resolve / --wmi / --wts /
+  --remote-exec / --enable-discovery) were built and unit-tested against
+  simulated protocol responses during development (hand-crafted
+  NetBIOS/SNMP/mDNS/LLMNR/SMB2 servers), but could NOT be validated
+  end-to-end against a real Windows domain, a live DCOM/WMI provider, a
+  real Terminal Services host, or a real Task Scheduler - there was no
+  such environment available at build time. Sections 9, 10, and 11 in
+  particular (--wmi, --wts, --remote-exec/--enable-discovery) are the
+  least-tested paths in the whole tool - all three were only confirmed
+  to fail cleanly (no crash, no hang, a specific readable error) against
+  closed ports and fake listeners under Wine, and separately confirmed
+  not to interfere with each other when combined (test 11.5) - but
+  never confirmed to actually succeed against a real target.
+  Test 10.2 (--wts with explicit credentials) and section 11 as a whole
+  are the hardest paths to have validated in a sandbox - LogonUserW's
+  behavior with LOGON32_LOGON_NEW_CREDENTIALS, and a Task Scheduler
+  task's actual execution/output behavior once registered, both
+  genuinely depend on the target's real configuration in ways that
+  can't be simulated. --enable-discovery specifically (test 11.3) has
+  never been confirmed to actually flip the firewall rules it's
+  supposed to on a real machine - only that the PowerShell one-liner it
+  runs matches what was manually verified to work during an earlier,
+  separate debugging session (see the git history around that point).
+  If anything in sections 7-11 misbehaves against real infrastructure,
   that's expected to be where bugs surface first - please report
   specifics (command used, expected vs actual output) rather than just
   "it didn't work".

@@ -23,6 +23,7 @@
 #include <objbase.h>
 #include <wbemidl.h>
 #include <wtsapi32.h>
+#include <taskschd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "taskschd.lib")
 
 /* ---------------------------------------------------------------------- */
 /* Общие структуры                                                        */
@@ -140,6 +142,18 @@ static int g_wmi_com_ready = 0;   /* CoInitializeSecurity выполнен ус�
 /* "требует прав" диагностики, что и --wmi, просто другой API/транспорт.  */
 /* ---------------------------------------------------------------------- */
 static int g_wts_mode = 0;
+
+/* ---------------------------------------------------------------------- */
+/* Task Scheduler (ITaskService, COM/DCOM), --remote-exec/--enable-       */
+/* discovery: гарантированный способ выполнить что-либо на целевой        */
+/* машине - задача бежит ЛОКАЛЬНО на цели под SYSTEM, а не через прямой   */
+/* RPC-вызов к реестру/службам, поэтому не спотыкается о те же сетевые    */
+/* ограничения. Использует ТЕ ЖЕ учётные данные --wmi-user/--wmi-password/*/
+/* --wmi-domain, что и --wmi/--wts.                                        */
+/* ---------------------------------------------------------------------- */
+static char g_remote_exec_cmd[1024] = "";
+static int g_remote_exec_timeout_ms = 15000;
+static int g_enable_discovery = 0;
 static int g_update_oui_only = 0;   /* --update-oui: только скачать базу OUI и выйти */
 #define OUI_URL "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes"
 
@@ -194,6 +208,9 @@ typedef struct {
     char wts_logon_time[32];
     char wts_connect_time[32];
     double wts_idle_minutes; /* -1 = неизвестно */
+    int has_remote_exec;
+    char remote_exec_error[160];
+    LONG remote_exec_code; /* код возврата задачи */
     const char *device_guess;
 } HostInfo;
 
@@ -1968,6 +1985,194 @@ static int wts_query_host(uint32_t ip_h, HostInfo *hi) {
     return found;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Task Scheduler (ITaskService, COM/DCOM) - отказоустойчивый способ      */
+/* выполнить произвольную команду на удалённой машине. В отличие от       */
+/* прямого RPC к реестру/службам, задача физически бежит ЛОКАЛЬНО на      */
+/* цели под SYSTEM после регистрации - не спотыкается о те же сетевые     */
+/* ограничения, что могли зарубить прямой путь.                           */
+/* ---------------------------------------------------------------------- */
+
+/* --enable-discovery: включает правила файрвола группы NETDIS* по маске
+   ИМЕНИ (не локализованному DisplayGroup - имена вида "Обнаружение сети"
+   зависят от языка системы, а Name всегда "NETDIS-..." независимо от
+   локали) - именно так это было предметно проверено вживую при отладке
+   NetBIOS/LLMNR. Плюс best-effort попытка поднять сопутствующие службы
+   (SilentlyContinue - чтобы отсутствие одной службы не рушило остальное). */
+static const char *DISCOVERY_ENABLE_CMD =
+    "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+    "\"Get-NetFirewallRule | Where-Object {$_.Name -like 'NETDIS*'} | Enable-NetFirewallRule; "
+    "Set-Service -Name FDResPub -StartupType Automatic -ErrorAction SilentlyContinue; "
+    "Start-Service FDResPub -ErrorAction SilentlyContinue; "
+    "Set-Service -Name fdPHost -StartupType Automatic -ErrorAction SilentlyContinue; "
+    "Start-Service fdPHost -ErrorAction SilentlyContinue; "
+    "Set-Service -Name SSDPSRV -StartupType Automatic -ErrorAction SilentlyContinue; "
+    "Start-Service SSDPSRV -ErrorAction SilentlyContinue; "
+    "Set-Service -Name upnphost -StartupType Automatic -ErrorAction SilentlyContinue; "
+    "Start-Service upnphost -ErrorAction SilentlyContinue\"";
+
+static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout_ms,
+                             char *err_out, size_t err_cap, LONG *exit_code_out) {
+    err_out[0] = 0;
+
+    if (!tcp_check(ip_h, 135, 700)) {
+        snprintf(err_out, err_cap, "порт 135 (RPC) недоступен");
+        return 0;
+    }
+
+    char ipstr[64];
+    u32_to_ip_str(ip_h, ipstr, sizeof(ipstr));
+    wchar_t wip[64];
+    ascii_to_wide(ipstr, wip, sizeof(wip) / sizeof(wchar_t));
+
+    ITaskService *pService = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_ITaskService, (LPVOID *)&pService);
+    if (FAILED(hr) || !pService) {
+        snprintf(err_out, err_cap, "CoCreateInstance: 0x%08lX", (unsigned long)hr);
+        return 0;
+    }
+
+    VARIANT vServer, vUser, vDomain, vPass;
+    VariantInit(&vServer); VariantInit(&vUser); VariantInit(&vDomain); VariantInit(&vPass);
+    vServer.vt = VT_BSTR;
+    vServer.bstrVal = SysAllocString(wip);
+    if (g_wmi_user[0]) {
+        wchar_t wu[128], wd[128], wp[128];
+        ascii_to_wide(g_wmi_user, wu, 128);
+        ascii_to_wide(g_wmi_password, wp, 128);
+        vUser.vt = VT_BSTR;
+        vUser.bstrVal = SysAllocString(wu);
+        vPass.vt = VT_BSTR;
+        vPass.bstrVal = SysAllocString(wp);
+        if (g_wmi_domain[0]) {
+            ascii_to_wide(g_wmi_domain, wd, 128);
+            vDomain.vt = VT_BSTR;
+            vDomain.bstrVal = SysAllocString(wd);
+        }
+    }
+
+    hr = ITaskService_Connect(pService, vServer, vUser, vDomain, vPass);
+    VariantClear(&vServer); VariantClear(&vUser); VariantClear(&vDomain); VariantClear(&vPass);
+
+    if (FAILED(hr)) {
+        snprintf(err_out, err_cap, "Connect: 0x%08lX (нет доступа/файрвол/Task Scheduler недоступен)",
+                 (unsigned long)hr);
+        ITaskService_Release(pService);
+        return 0;
+    }
+
+    ITaskFolder *pFolder = NULL;
+    BSTR bRoot = SysAllocString(L"\\");
+    hr = ITaskService_GetFolder(pService, bRoot, &pFolder);
+    SysFreeString(bRoot);
+    if (FAILED(hr) || !pFolder) {
+        snprintf(err_out, err_cap, "GetFolder: 0x%08lX", (unsigned long)hr);
+        ITaskService_Release(pService);
+        return 0;
+    }
+
+    ITaskDefinition *pTask = NULL;
+    hr = ITaskService_NewTask(pService, 0, &pTask);
+    if (FAILED(hr) || !pTask) {
+        snprintf(err_out, err_cap, "NewTask: 0x%08lX", (unsigned long)hr);
+        ITaskFolder_Release(pFolder);
+        ITaskService_Release(pService);
+        return 0;
+    }
+
+    IPrincipal *pPrincipal = NULL;
+    ITaskDefinition_get_Principal(pTask, &pPrincipal);
+    if (pPrincipal) {
+        BSTR bSystem = SysAllocString(L"SYSTEM");
+        IPrincipal_put_UserId(pPrincipal, bSystem);
+        SysFreeString(bSystem);
+        IPrincipal_put_LogonType(pPrincipal, TASK_LOGON_SERVICE_ACCOUNT);
+        IPrincipal_put_RunLevel(pPrincipal, TASK_RUNLEVEL_HIGHEST);
+        IPrincipal_Release(pPrincipal);
+    }
+
+    IActionCollection *pActions = NULL;
+    ITaskDefinition_get_Actions(pTask, &pActions);
+    IAction *pAction = NULL;
+    if (pActions) {
+        IActionCollection_Create(pActions, TASK_ACTION_EXEC, &pAction);
+        IActionCollection_Release(pActions);
+    }
+    IExecAction *pExec = NULL;
+    if (pAction) {
+        IAction_QueryInterface(pAction, &IID_IExecAction, (void **)&pExec);
+        IAction_Release(pAction);
+    }
+    if (pExec) {
+        BSTR bPath = SysAllocString(L"cmd.exe");
+        wchar_t wcmd[1024];
+        ascii_to_wide(command_line, wcmd, 1024);
+        wchar_t wargs[1200];
+        wcscpy(wargs, L"/c ");
+        wcscat(wargs, wcmd);
+        BSTR bArgs = SysAllocString(wargs);
+        IExecAction_put_Path(pExec, bPath);
+        IExecAction_put_Arguments(pExec, bArgs);
+        SysFreeString(bPath);
+        SysFreeString(bArgs);
+        IExecAction_Release(pExec);
+    }
+
+    BSTR bTaskName = SysAllocString(L"NetScanRemoteExec");
+    VARIANT vNoUser, vNoPass, vNoSddl;
+    VariantInit(&vNoUser); VariantInit(&vNoPass); VariantInit(&vNoSddl);
+    IRegisteredTask *pRegTask = NULL;
+    hr = ITaskFolder_RegisterTaskDefinition(pFolder, bTaskName, pTask, TASK_CREATE_OR_UPDATE,
+                                             vNoUser, vNoPass, TASK_LOGON_SERVICE_ACCOUNT,
+                                             vNoSddl, &pRegTask);
+    ITaskDefinition_Release(pTask);
+
+    if (FAILED(hr) || !pRegTask) {
+        snprintf(err_out, err_cap, "RegisterTaskDefinition: 0x%08lX", (unsigned long)hr);
+        SysFreeString(bTaskName);
+        ITaskFolder_Release(pFolder);
+        ITaskService_Release(pService);
+        return 0;
+    }
+
+    int ok = 0;
+    VARIANT vRunParams;
+    VariantInit(&vRunParams);
+    IRunningTask *pRunning = NULL;
+    hr = IRegisteredTask_Run(pRegTask, vRunParams, &pRunning);
+    if (FAILED(hr)) {
+        snprintf(err_out, err_cap, "Run: 0x%08lX", (unsigned long)hr);
+    } else {
+        /* опрашиваем состояние задачи с шагом 300мс до завершения или таймаута */
+        DWORD waited = 0;
+        TASK_STATE state = TASK_STATE_RUNNING;
+        while (waited < (DWORD)timeout_ms) {
+            Sleep(300);
+            waited += 300;
+            if (pRunning && SUCCEEDED(IRunningTask_get_State(pRunning, &state)) && state != TASK_STATE_RUNNING) break;
+        }
+        LONG exitCode = 0;
+        if (SUCCEEDED(IRegisteredTask_get_LastTaskResult(pRegTask, &exitCode))) {
+            if (exit_code_out) *exit_code_out = exitCode;
+            ok = 1;
+        } else {
+            snprintf(err_out, err_cap, "не удалось получить результат задачи (таймаут %d мс?)", timeout_ms);
+        }
+        if (pRunning) IRunningTask_Release(pRunning);
+    }
+
+    /* подчищаем за собой - не оставляем задачу на целевой машине */
+    IRegisteredTask_Release(pRegTask);
+    ITaskFolder_DeleteTask(pFolder, bTaskName, 0);
+    SysFreeString(bTaskName);
+
+    ITaskFolder_Release(pFolder);
+    ITaskService_Release(pService);
+
+    return ok;
+}
+
 static void gather_host_info(HostInfo *hi) {
     if (!hi->has_ttl) {
         int ttl;
@@ -2026,6 +2231,16 @@ static void gather_host_info(HostInfo *hi) {
         wts_query_host(hi->ip, hi);
     }
 
+    if (g_enable_discovery || g_remote_exec_cmd[0]) {
+        const char *cmd = g_enable_discovery ? DISCOVERY_ENABLE_CMD : g_remote_exec_cmd;
+        LONG code = -1;
+        if (task_remote_exec(hi->ip, cmd, g_remote_exec_timeout_ms,
+                              hi->remote_exec_error, sizeof(hi->remote_exec_error), &code)) {
+            hi->has_remote_exec = 1;
+            hi->remote_exec_code = code;
+        }
+    }
+
     hi->device_guess = guess_device_by_ports(hi->ip);
 }
 
@@ -2035,7 +2250,8 @@ static void wait_for_all_threads(HANDLE *handles, int count); /* определ�
 
 static DWORD WINAPI worker_info(LPVOID param) {
     (void)param;
-    if (g_wmi_mode) CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    int need_com = g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0];
+    if (need_com) CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     for (;;) {
         LONG64 idx = InterlockedIncrement64((volatile LONG64 *)&g_info_claim) - 1;
@@ -2043,7 +2259,7 @@ static DWORD WINAPI worker_info(LPVOID param) {
         gather_host_info(&g_host_infos[idx]);
     }
 
-    if (g_wmi_mode) CoUninitialize();
+    if (need_com) CoUninitialize();
     return 0;
 }
 
@@ -2239,6 +2455,13 @@ static void print_host_info_section(FILE *f) {
         } else if (g_wts_mode && hi->wts_error[0]) {
             conprintf("  WTS: не удалось (%s)\n", hi->wts_error);
             if (f) fprintf(f, "  WTS: не удалось (%s)\n", hi->wts_error);
+        }
+        if (hi->has_remote_exec) {
+            conprintf("  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
+            if (f) fprintf(f, "  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
+        } else if ((g_enable_discovery || g_remote_exec_cmd[0]) && hi->remote_exec_error[0]) {
+            conprintf("  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
+            if (f) fprintf(f, "  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
         }
     }
 }
@@ -2833,6 +3056,16 @@ static void print_usage(const char *prog) {
         "                    штатные quser/qwinsta): текущего пользователя сессии, время\n"
         "                    логона, время бездействия. Использует ТЕ ЖЕ --wmi-user/\n"
         "                    --wmi-password/--wmi-domain, что и --wmi. Включает --info.\n"
+        "  --remote-exec CMD  выполнить произвольную команду на каждой цели через Task\n"
+        "                     Scheduler (COM/DCOM) - гарантированный способ: задача бежит\n"
+        "                     ЛОКАЛЬНО на цели под SYSTEM, не спотыкается о сетевые\n"
+        "                     ограничения, которые могли бы зарубить прямой RPC. Те же\n"
+        "                     учётные данные --wmi-user/--wmi-password/--wmi-domain.\n"
+        "  --remote-exec-timeout N  сколько мс ждать завершения задачи (по умолчанию 15000).\n"
+        "  --enable-discovery  включить NetBIOS/LLMNR/Network Discovery через Task\n"
+        "                      Scheduler (Enable-NetFirewallRule по маске имени NETDIS*,\n"
+        "                      локаль-независимо, плюс попытка поднять сопутствующие\n"
+        "                      службы). Использует тот же механизм, что --remote-exec.\n"
         "  --sort-by-port   доп. файл result_by_port.txt с теми же результатами, но\n"
         "                   отсортированными по порту (основной файл по IP не меняется -\n"
         "                   сохраняются оба варианта одновременно).\n"
@@ -2905,6 +3138,15 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--wts") == 0) {
             g_wts_mode = 1;
             g_info_mode = 1; /* --wts подразумевает --info */
+        } else if (strcmp(argv[i], "--remote-exec") == 0 && i + 1 < argc) {
+            strncpy(g_remote_exec_cmd, argv[++i], sizeof(g_remote_exec_cmd) - 1);
+            g_info_mode = 1;
+        } else if (strcmp(argv[i], "--remote-exec-timeout") == 0 && i + 1 < argc) {
+            g_remote_exec_timeout_ms = atoi(argv[++i]);
+            if (g_remote_exec_timeout_ms < 1000) g_remote_exec_timeout_ms = 1000;
+        } else if (strcmp(argv[i], "--enable-discovery") == 0) {
+            g_enable_discovery = 1;
+            g_info_mode = 1;
         } else if (strcmp(argv[i], "--sort-by-port") == 0) {
             g_sort_by_port_also = 1;
         } else if (strcmp(argv[i], "--sort-os") == 0) {
@@ -2964,7 +3206,7 @@ int main(int argc, char **argv) {
 
     DWORD t0 = GetTickCount();
 
-    if (g_wmi_mode) {
+    if (g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0]) {
         HRESULT hr_com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr_com) || hr_com == S_FALSE) {
             HRESULT hr_sec = CoInitializeSecurity(NULL, -1, NULL, NULL,
@@ -2973,11 +3215,11 @@ int main(int argc, char **argv) {
             if (SUCCEEDED(hr_sec)) {
                 g_wmi_com_ready = 1;
             } else {
-                conprintf_err("CoInitializeSecurity не удался (0x%08lX) - --wmi работать не будет\n",
+                conprintf_err("CoInitializeSecurity не удался (0x%08lX) - --wmi/--remote-exec работать не будут\n",
                                (unsigned long)hr_sec);
             }
         } else {
-            conprintf_err("CoInitializeEx не удался (0x%08lX) - --wmi работать не будет\n",
+            conprintf_err("CoInitializeEx не удался (0x%08lX) - --wmi/--remote-exec работать не будут\n",
                            (unsigned long)hr_com);
         }
     }
