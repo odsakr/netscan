@@ -142,6 +142,7 @@ static int g_wmi_com_ready = 0;   /* CoInitializeSecurity выполнен ус�
 /* "требует прав" диагностики, что и --wmi, просто другой API/транспорт.  */
 /* ---------------------------------------------------------------------- */
 static int g_wts_mode = 0;
+static int g_wsd_mode = 0; /* --wsd: WS-Discovery (то же, чем пользуется "Сеть" в проводнике) */
 
 /* ---------------------------------------------------------------------- */
 /* Task Scheduler (ITaskService, COM/DCOM), --remote-exec/--enable-       */
@@ -183,6 +184,9 @@ typedef struct {
     char mdns_name[256];
     int has_llmnr;
     char llmnr_name[256];
+    int has_wsd;
+    char wsd_types[256];
+    char wsd_name[128];
     int has_ptr;
     char ptr_name[256];
     int has_smb;
@@ -1133,6 +1137,8 @@ static int netbios_nbstat(uint32_t ip_h, int timeout_ms,
    избыточен для наших целей - просто вытаскиваем первую достаточно длинную
    печатаемую ASCII-подстроку из ответа (обычно это и есть имя хоста или
    имя сервиса). */
+static int dns_read_name(const unsigned char *buf, int buflen, int offset, char *out, size_t out_cap); /* определена ниже */
+
 static int mdns_query(uint32_t ip_h, int timeout_ms, char *out, size_t out_cap) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return 0;
@@ -1171,16 +1177,62 @@ static int mdns_query(uint32_t ip_h, int timeout_ms, char *out, size_t out_cap) 
     closesocket(s);
     if (r <= 12) return 0;
 
-    /* многие респондеры эхают вопрос обратно в ответе - это неинтересная
-       часть (просто наш же запрос), пропускаем её, чтобы не выхватить её
-       вместо реальных данных из секции ответа */
+    /* --- Строгий разбор: честно проходим секцию вопросов, потом секцию   */
+    /* ответов, ищем первую PTR-запись (это и есть имя сервиса/инстанса -  */
+    /* например "MyPrinter._ipp._tcp.local") либо, если PTR нет, первую    */
+    /* SRV-запись (там TARGET - это имя хоста). Учитывает сжатие имён      */
+    /* (0xC0XX), поэтому не путается в реальных ответах так, как могла бы  */
+    /* спутаться простая подстрочная эвристика.                            */
+    int qdcount = (buf[4] << 8) | buf[5];
+    int ancount = (buf[6] << 8) | buf[7];
+    int p = 12;
+    char tmp[256];
+    int strict_ok = 1;
+
+    for (int qi = 0; qi < qdcount && strict_ok; qi++) {
+        int consumed = dns_read_name(buf, r, p, tmp, sizeof(tmp));
+        if (consumed < 0) { strict_ok = 0; break; }
+        p += consumed + 4; /* QTYPE(2) + QCLASS(2) */
+        if (p > r) { strict_ok = 0; break; }
+    }
+
+    int found_strict = 0;
+    if (strict_ok) {
+        for (int ai = 0; ai < ancount && p < r && !found_strict; ai++) {
+            int consumed = dns_read_name(buf, r, p, tmp, sizeof(tmp));
+            if (consumed < 0) break;
+            p += consumed;
+            if (p + 10 > r) break;
+
+            uint16_t rtype = (uint16_t)((buf[p] << 8) | buf[p + 1]);
+            uint16_t rdlen = (uint16_t)((buf[p + 8] << 8) | buf[p + 9]);
+            int rdata_start = p + 10;
+            if (rdata_start + rdlen > r) break;
+
+            if (rtype == 12) { /* PTR - RDATA целиком является DNS-именем */
+                consumed = dns_read_name(buf, r, rdata_start, out, out_cap);
+                if (consumed > 0 && out[0]) found_strict = 1;
+            } else if (rtype == 33 && rdlen > 6) { /* SRV: priority(2)+weight(2)+port(2)+target */
+                consumed = dns_read_name(buf, r, rdata_start + 6, out, out_cap);
+                if (consumed > 0 && out[0]) found_strict = 1;
+            }
+
+            p = rdata_start + rdlen;
+        }
+    }
+
+    if (found_strict) return 1;
+
+    /* --- Откат: строгий разбор ничего не нашёл (нестандартный ответ,     */
+    /* неожиданный формат и т.п.) - вместо того чтобы вернуть пустоту,      */
+    /* используем прежнюю эвристику "самая длинная печатаемая подстрока",  */
+    /* чтобы не потерять то, что раньше всё-таки находилось. Пропускаем    */
+    /* эхо собственного запроса, если респондер его повторяет в ответе.    */
     int scan_from = 12;
     if ((size_t)r >= sizeof(q) && memcmp(buf + 12, q + 12, sizeof(q) - 12) == 0) {
         scan_from = (int)sizeof(q);
     }
 
-    /* берём САМУЮ ДЛИННУЮ печатаемую ASCII-подстроку - обычно это и есть
-       осмысленное имя хоста/сервиса, а не короткий случайный фрагмент */
     int best_start = -1, best_len = 0;
     int start = -1;
     for (int i = scan_from; i <= r; i++) {
@@ -1326,6 +1378,212 @@ static int llmnr_query(uint32_t dest_ip, uint32_t query_ip, int timeout_ms, char
     consumed = dns_read_name(buf, r, p, out, out_cap);
     if (consumed < 0 || out[0] == 0) return 0;
     return 1;
+}
+
+/* ---------------------------------------------------------------------- */
+/* WS-Discovery (UDP 3702) - то же, чем пользуется "Сеть" в проводнике    */
+/* Windows для отображения устройств и их "дружественных" имён. Двухшаговый */
+/* протокол: сначала UDP Probe -> ProbeMatch (даёт Types и XAddrs - ссылку */
+/* на метаданные устройства), затем HTTP-запрос по XAddrs (WS-Transfer     */
+/* Get) даёт собственно FriendlyName. Полноценного XML-парсера у нас нет - */
+/* как и для mDNS, используется прагматичный, но аккуратный по границам   */
+/* тега экстрактор, а не честный разбор всего SOAP-документа.             */
+/* ---------------------------------------------------------------------- */
+
+/* Ищет <ns:Tag ...>содержимое</ns:Tag> или <Tag ...>содержимое</Tag>,
+   без разбора пространств имён по-честному - просто аккуратно проверяет
+   границы имени тега (после него должен идти '>', пробел или '/'), чтобы
+   не спутать, например, "XAddrs" с "XAddrsFoo". Берёт первое совпадение -
+   для ProbeMatches с одним ProbeMatch этого достаточно. */
+static int extract_xml_tag(const char *buf, int len, const char *tag, char *out, size_t out_cap) {
+    out[0] = 0;
+    int tag_len = (int)strlen(tag);
+
+    for (int i = 0; i < len - 1; i++) {
+        if (buf[i] != '<' || buf[i + 1] == '/') continue;
+
+        int name_start = i + 1;
+        for (int j = name_start; j < len && j < name_start + 32; j++) {
+            if (buf[j] == ':') { name_start = j + 1; break; }
+            if (buf[j] == '>' || buf[j] == ' ' || buf[j] == '/') break;
+        }
+        if (name_start + tag_len > len) continue;
+        if (memcmp(buf + name_start, tag, (size_t)tag_len) != 0) continue;
+
+        char after = buf[name_start + tag_len];
+        if (after != '>' && after != ' ' && after != '/' &&
+            after != '\r' && after != '\n' && after != '\t') continue;
+
+        int close_bracket = -1;
+        for (int j = name_start + tag_len; j < len && j < name_start + tag_len + 512; j++) {
+            if (buf[j] == '>') { close_bracket = j; break; }
+        }
+        if (close_bracket < 0) continue;
+        if (buf[close_bracket - 1] == '/') continue; /* самозакрывающийся тег - содержимого нет */
+
+        int content_start = close_bracket + 1;
+        int content_end = -1;
+        int scan_limit = content_start + (int)out_cap + 512;
+        for (int j = content_start; j < len - 1 && j < scan_limit; j++) {
+            if (buf[j] == '<' && buf[j + 1] == '/') { content_end = j; break; }
+        }
+        if (content_end < 0) continue;
+
+        int clen = content_end - content_start;
+        if (clen <= 0) continue;
+        if (clen >= (int)out_cap) clen = (int)out_cap - 1;
+        memcpy(out, buf + content_start, (size_t)clen);
+        out[clen] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* Не крипто-стойкий UUID - для MessageID это и не нужно, важна лишь
+   непохожесть между запросами, а не настоящая случайность. */
+static void generate_uuid_string(char *out, size_t cap) {
+    static volatile LONG counter = 0;
+    LONG n = InterlockedIncrement(&counter);
+    DWORD t = GetTickCount();
+    DWORD tid = GetCurrentThreadId();
+    snprintf(out, cap, "%08lx-%04lx-4%03lx-%04lx-%08lx%04lx",
+             (unsigned long)t, (unsigned long)(tid & 0xFFFF), (unsigned long)(n & 0xFFF),
+             (unsigned long)(((tid ^ (DWORD)n) & 0x3FFF) | 0x8000),
+             (unsigned long)t, (unsigned long)(n & 0xFFFF));
+}
+
+/* Второй шаг: по адресу из XAddrs шлём WS-Transfer Get и вытаскиваем
+   FriendlyName из ответа. Best-effort - многие устройства могут ответить
+   иначе, чем ожидается, любая неудача здесь просто означает "имени нет",
+   а не ошибку всего сканирования. */
+static int wsd_fetch_friendly_name(const char *xaddr_url, int timeout_ms, char *out, size_t out_cap) {
+    if (strncmp(xaddr_url, "http://", 7) != 0) return 0;
+    const char *p = xaddr_url + 7;
+
+    char host[128];
+    int port = 80;
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    size_t host_len;
+    if (colon && (!slash || colon < slash)) {
+        host_len = (size_t)(colon - p);
+        port = atoi(colon + 1);
+    } else {
+        host_len = slash ? (size_t)(slash - p) : strlen(p);
+    }
+    if (host_len == 0 || host_len >= sizeof(host)) return 0;
+    memcpy(host, p, host_len);
+    host[host_len] = 0;
+    const char *path = slash ? slash : "/";
+
+    HINTERNET hInternet = InternetOpenA("NetScan/1.0", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (!hInternet) return 0;
+
+    DWORD to = (DWORD)timeout_ms;
+    InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof(to));
+    InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &to, sizeof(to));
+    InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof(to));
+
+    HINTERNET hConnect = InternetConnectA(hInternet, host, (INTERNET_PORT)port, NULL, NULL,
+                                           INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConnect) { InternetCloseHandle(hInternet); return 0; }
+
+    HINTERNET hRequest = HttpOpenRequestA(hConnect, "POST", path, NULL, NULL, NULL,
+                                           INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_RELOAD, 0);
+    if (!hRequest) { InternetCloseHandle(hConnect); InternetCloseHandle(hInternet); return 0; }
+
+    char msgid[48];
+    generate_uuid_string(msgid, sizeof(msgid));
+    char body[512];
+    int blen = snprintf(body, sizeof(body),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\" "
+        "xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\">"
+        "<soap:Header>"
+        "<wsa:To>%s</wsa:To>"
+        "<wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/Get</wsa:Action>"
+        "<wsa:MessageID>urn:uuid:%s</wsa:MessageID>"
+        "</soap:Header><soap:Body/></soap:Envelope>", xaddr_url, msgid);
+
+    static const char *headers = "Content-Type: application/soap+xml; charset=utf-8\r\n";
+    BOOL sent = HttpSendRequestA(hRequest, headers, (DWORD)strlen(headers), body, (DWORD)blen);
+
+    int ok = 0;
+    if (sent) {
+        char rbuf[4096];
+        DWORD total = 0, got = 0;
+        while (total < sizeof(rbuf) - 1 &&
+               InternetReadFile(hRequest, rbuf + total, sizeof(rbuf) - 1 - total, &got) && got > 0) {
+            total += got;
+        }
+        rbuf[total] = 0;
+        if (total > 0) ok = extract_xml_tag(rbuf, (int)total, "FriendlyName", out, out_cap);
+    }
+
+    InternetCloseHandle(hRequest);
+    InternetCloseHandle(hConnect);
+    InternetCloseHandle(hInternet);
+    return ok;
+}
+
+/* Первый шаг: отправляет Probe, разбирает ProbeMatch на Types (сырые
+   типы устройства - принтер, компьютер и т.п.) и XAddrs (ссылка на
+   метаданные), затем при наличии XAddrs подтягивает FriendlyName. */
+static int wsd_query_host(uint32_t ip_h, int timeout_ms,
+                           char *types_out, size_t types_cap,
+                           char *name_out, size_t name_cap) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(3702);
+    addr.sin_addr.s_addr = htonl(ip_h);
+
+    char msgid[48];
+    generate_uuid_string(msgid, sizeof(msgid));
+    char probe[512];
+    int plen = snprintf(probe, sizeof(probe),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\" "
+        "xmlns:wsa=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" "
+        "xmlns:wsd=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\">"
+        "<soap:Header>"
+        "<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>"
+        "<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>"
+        "<wsa:MessageID>urn:uuid:%s</wsa:MessageID>"
+        "</soap:Header>"
+        "<soap:Body><wsd:Probe/></soap:Body>"
+        "</soap:Envelope>", msgid);
+
+    sendto(s, probe, plen, 0, (struct sockaddr *)&addr, sizeof(addr));
+
+    DWORD to = (DWORD)timeout_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&to, sizeof(to));
+
+    char buf[4096];
+    struct sockaddr_in from;
+    int fromlen = sizeof(from);
+    int r = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fromlen);
+    closesocket(s);
+    if (r <= 0) return 0;
+    buf[r] = 0;
+
+    int got_types = extract_xml_tag(buf, r, "Types", types_out, types_cap);
+
+    char xaddrs[512];
+    if (extract_xml_tag(buf, r, "XAddrs", xaddrs, sizeof(xaddrs))) {
+        char first_url[256];
+        char *sp = strchr(xaddrs, ' ');
+        size_t ulen = sp ? (size_t)(sp - xaddrs) : strlen(xaddrs);
+        if (ulen >= sizeof(first_url)) ulen = sizeof(first_url) - 1;
+        memcpy(first_url, xaddrs, ulen);
+        first_url[ulen] = 0;
+        wsd_fetch_friendly_name(first_url, timeout_ms, name_out, name_cap);
+    }
+
+    return got_types || name_out[0];
 }
 
 /* Обратный DNS (PTR) через обычный DNS-сервер (обычно роутер или, в
@@ -2208,6 +2466,13 @@ static void gather_host_info(HostInfo *hi) {
         hi->has_llmnr = 1;
     }
 
+    if (g_wsd_mode) {
+        if (wsd_query_host(qip, 800, hi->wsd_types, sizeof(hi->wsd_types),
+                            hi->wsd_name, sizeof(hi->wsd_name))) {
+            hi->has_wsd = 1;
+        }
+    }
+
     if (g_deep_resolve) {
         uint32_t dns_srv = g_dns_server_override ? g_dns_server_override : g_gateway_ip;
         if (reverse_dns_query(dns_srv, hi->ip, 1000, hi->ptr_name, sizeof(hi->ptr_name))) {
@@ -2395,6 +2660,16 @@ static void print_host_info_section(FILE *f) {
         if (hi->has_llmnr) {
             conprintf("  LLMNR (имя компьютера): %s\n", hi->llmnr_name);
             if (f) fprintf(f, "  LLMNR (имя компьютера): %s\n", hi->llmnr_name);
+        }
+        if (hi->has_wsd) {
+            if (hi->wsd_types[0]) {
+                conprintf("  WSD Types: %s\n", hi->wsd_types);
+                if (f) fprintf(f, "  WSD Types: %s\n", hi->wsd_types);
+            }
+            if (hi->wsd_name[0]) {
+                conprintf("  WSD имя: %s\n", hi->wsd_name);
+                if (f) fprintf(f, "  WSD имя: %s\n", hi->wsd_name);
+            }
         }
         if (hi->has_ptr) {
             conprintf("  PTR (обратный DNS): %s\n", hi->ptr_name);
@@ -3137,7 +3412,10 @@ int main(int argc, char **argv) {
             strncpy(g_wmi_domain, argv[++i], sizeof(g_wmi_domain) - 1);
         } else if (strcmp(argv[i], "--wts") == 0) {
             g_wts_mode = 1;
-            g_info_mode = 1; /* --wts подразумевает --info */
+            g_info_mode = 1;
+        } else if (strcmp(argv[i], "--wsd") == 0) {
+            g_wsd_mode = 1;
+            g_info_mode = 1;
         } else if (strcmp(argv[i], "--remote-exec") == 0 && i + 1 < argc) {
             strncpy(g_remote_exec_cmd, argv[++i], sizeof(g_remote_exec_cmd) - 1);
             g_info_mode = 1;
