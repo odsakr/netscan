@@ -520,10 +520,56 @@ it at.
 
 
 ================================================================================
-12. OUTPUT HANDLING
+12. WS-DISCOVERY (--wsd)
 ================================================================================
 
-10.1  --resume + --when as a monitoring log
+Unlike --wmi/--wts/--remote-exec, this needs no credentials and no
+rights - same "just works or cleanly doesn't" expectation as NetBIOS/
+mDNS/LLMNR in section 7.
+
+12.1  Baseline sweep against a mixed network
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 3702
+                      --proto udp --mode full --threads 30
+                      --discover --wsd
+
+      Expect: "WSD Types: ..." for actual Windows machines, network
+      printers/scanners, and NAS devices that answer WS-Discovery
+      probes (most non-Windows/non-WSD-aware devices simply won't
+      respond - that's normal, not a bug). Where XAddrs was present in
+      the ProbeMatch, also expect "WSD name: ..." with a readable
+      friendly name (e.g. the machine's display name in Explorer's
+      Network view) - cross-check by opening \\<ip>\ or the "Network"
+      folder on a Windows machine on the same subnet and comparing
+      names.
+
+12.2  Types without a name
+
+      Some devices answer the Probe (so Types is populated) but either
+      have no XAddrs in the ProbeMatch or the WS-Transfer Get to
+      XAddrs fails/times out. Expect "WSD Types: ..." alone in that
+      case, with no "WSD name:" line - not an empty/garbled name line.
+      Printers and simpler embedded devices are the most likely
+      candidates for this; a real Windows PC should normally give both.
+
+12.3  Combine with --info's other name sources on the same host
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 3702,5353,5355,137
+                      --proto udp --mode full --threads 5
+                      --wsd --info
+
+      Expect NetBIOS/mDNS/LLMNR/WSD name fields to appear together for
+      the same host and agree with each other (all resolving to the
+      same machine name, possibly in different cases/formats) -
+      confirms --wsd doesn't interfere with the other resolution paths
+      when run alongside them.
+
+
+================================================================================
+13. OUTPUT HANDLING
+================================================================================
+
+13.1  --resume + --when as a monitoring log
 
       netscan_x64.exe --ip 192.168.1.1-192.168.1.10 --ports 80,443
                       --proto tcp --mode full --threads 10
@@ -534,7 +580,7 @@ it at.
       overwritten. Timestamps should be a few seconds apart and match
       wall-clock time.
 
-10.2  --sort-by-port produces a second file without touching the first
+13.2  --sort-by-port produces a second file without touching the first
 
       netscan_x64.exe --ip 192.168.1.1-192.168.1.254
                       --ports 22,80,443,3389 --proto tcp
@@ -549,10 +595,10 @@ it at.
 
 
 ================================================================================
-13. STARTUP / UX
+14. STARTUP / UX
 ================================================================================
 
-11.1  Startup indicator appears immediately
+14.1  Startup indicator appears immediately
 
       netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 1-1000
                       --proto tcp --mode full --threads 10
@@ -568,10 +614,10 @@ it at.
 NOTES FOR WHOEVER RUNS THIS
 ================================================================================
 
-- Tests in sections 7-11 (--info / --deep-resolve / --wmi / --wts /
-  --remote-exec / --enable-discovery) were built and unit-tested against
-  simulated protocol responses during development (hand-crafted
-  NetBIOS/SNMP/mDNS/LLMNR/SMB2 servers), but could NOT be validated
+- Tests in sections 7-12 (--info / --deep-resolve / --wmi / --wts /
+  --remote-exec / --enable-discovery / --wsd) were built and unit-tested
+  against simulated protocol responses during development (hand-crafted
+  NetBIOS/SNMP/mDNS/LLMNR/SMB2/WS-Discovery servers), but could NOT be validated
   end-to-end against a real Windows domain, a live DCOM/WMI provider, a
   real Terminal Services host, or a real Task Scheduler - there was no
   such environment available at build time. Sections 9, 10, and 11 in
@@ -591,10 +637,15 @@ NOTES FOR WHOEVER RUNS THIS
   supposed to on a real machine - only that the PowerShell one-liner it
   runs matches what was manually verified to work during an earlier,
   separate debugging session (see the git history around that point).
-  If anything in sections 7-11 misbehaves against real infrastructure,
+  If anything in sections 7-12 misbehaves against real infrastructure,
   that's expected to be where bugs surface first - please report
   specifics (command used, expected vs actual output) rather than just
   "it didn't work".
+- The stricter mDNS parser (PTR/SRV records with DNS-compression
+  support, section 7) and --wsd (section 12) are both new and were only
+  exercised against a wine-hosted simulated server, never a real mDNS
+  responder or WS-Discovery device - worth extra scrutiny on the first
+  real run.
 - Always compare a new build's results against a known-good previous
   run when in doubt - most of these tests are about catching
   regressions, not proving correctness from a blank slate.

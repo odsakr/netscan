@@ -22,7 +22,10 @@ Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt)
   since most services silently ignore malformed probes
 - Low-cost device fingerprinting, one request per host rather than per port
   (`--info`): MAC + vendor from an OUI database, OS guess from TTL, device
-  type from open-port patterns, NetBIOS, mDNS, LLMNR, SNMP sysDescr
+  type from open-port patterns, NetBIOS, mDNS (strict PTR/SRV parsing with
+  DNS-compression support, falling back to a heuristic if that finds
+  nothing), LLMNR, SNMP sysDescr, WS-Discovery (`--wsd`) device type and
+  friendly name - the same mechanism Explorer's "Network" view uses
 - Deeper hostname resolution (`--deep-resolve`): reverse DNS and an
   unauthenticated SMB2/NTLMSSP handshake (works both in a workgroup and
   in an AD domain)
@@ -79,9 +82,10 @@ prompt, just an .exe you can drop anywhere.
 
 ## TODO
 
-See the TODO section at the end of [HELP.txt](HELP.txt) — it covers the
-planned WMI-based diagnostics layer (exact OS version/build, CPU cores,
-RAM, logged-in user) and remote configuration via DCOM/WinRM.
+See the TODO section at the end of [HELP.txt](HELP.txt) — remaining items
+are a GUI on top of the console core, WinRM as an alternative WMI/WTS
+transport, mining the Security event log for logoff time, and capturing
+`--remote-exec` stdout/stderr instead of just the exit code.
 
 ## License
 

@@ -383,10 +383,18 @@ All other UDP ports use the regular minimal probe.
         workgroup/domain.
 
     mDNS (UDP 5353)
-        A service-list query ("_services._dns-sd._udp.local"). Without
-        a full DNS-compression parser - the longest printable ASCII
-        substring is extracted from the reply (usually the hostname or
-        service type). Works best for Android, printers, smart devices,
+        A service-list query ("_services._dns-sd._udp.local"). The
+        reply is parsed honestly: the question section is walked, then
+        the answer section, looking for the first PTR record (the
+        service/instance name, e.g. "MyPrinter._ipp._tcp.local") or,
+        if there's no PTR, the first SRV record (its TARGET field is
+        the host name). DNS name compression (0xC0XX pointers) is
+        followed correctly, so this isn't confused by the pointer-heavy
+        replies real mDNS responders send back. If the strict parse
+        finds nothing (a non-standard or unexpected reply shape), it
+        falls back to the previous approach - the longest printable
+        ASCII substring in the packet - so nothing that used to be
+        found is lost. Works best for Android, printers, smart devices,
         and Linux.
 
     LLMNR (UDP 5355) - Windows computer name
@@ -605,6 +613,37 @@ don't administer.
     in practice - if both are given, --enable-discovery's canned script
     takes priority.
 
+--wsd
+    Turns on --info automatically. Queries WS-Discovery (UDP 3702) -
+    the same protocol Windows Explorer's "Network" view uses to find
+    devices and show their "friendly" names. Unlike NetBIOS/LLMNR/mDNS
+    above, this needs no special rights and works entirely anonymously,
+    same as those.
+
+    Two-step protocol:
+      1. A UDP Probe is sent to port 3702. A responding device answers
+         with a ProbeMatch containing Types (raw device type(s), e.g.
+         "devseq:ComputerV1" or a printer/scanner type) and XAddrs (a
+         URL pointing at the device's metadata).
+      2. If XAddrs was present, an HTTP POST (WS-Transfer Get) is sent
+         to that URL via WinINet, and FriendlyName is extracted from
+         the SOAP response - this is the actual human-readable device
+         name (e.g. "DESKTOP-ABC123" or "HP LaserJet M404").
+
+    There's no full XML/SOAP parser here - same pragmatic approach as
+    mDNS below: a small helper looks for a specific tag by name
+    (tolerating a namespace prefix and self-closing tags) and extracts
+    its content, rather than parsing the whole document. Good enough
+    for the well-formed ProbeMatch/Get-response shapes real Windows/
+    printer/NAS devices send. Any failure at either step (no reply,
+    unparseable XML, HTTP error fetching XAddrs) just means "no WSD
+    data for this host", not a scan error.
+
+    Shown as two separate lines when available - "WSD Types" (from
+    step 1 alone) and "WSD name" (only if step 2 also succeeded); a
+    host can have Types without a name if it answers the Probe but the
+    XAddrs fetch fails or there is no XAddrs at all.
+
 --------------------------------------------------------------------------
 8. OUTPUT AND SAVING RESULTS
 --------------------------------------------------------------------------
@@ -634,6 +673,8 @@ don't administer.
           SNMP sysDescr: ...
           mDNS: ...
           LLMNR (computer name): ...
+          WSD Types: ...                    (only with --wsd)
+          WSD name: ...                     (only with --wsd)
           PTR (reverse DNS): ...           (only with --deep-resolve)
           SMB NetBIOS: name=... domain=... (only with --deep-resolve)
           SMB DNS: name=... domain=...     (only with --deep-resolve)
@@ -803,16 +844,20 @@ Discussed but NOT YET IMPLEMENTED:
 
   [ ] A GUI version built on top of the already-working console core.
 
-  [ ] WS-Discovery (UDP 3702) as an additional computer-name source -
+  [x] WS-Discovery (UDP 3702) as an additional computer-name source -
       the same mechanism Windows Explorer's "Network" view uses to
-      display "friendly" device names. More involved to parse (needs a
-      minimal SOAP/XML parser), deprioritized relative to the methods
-      already implemented.
+      display "friendly" device names (--wsd). DONE - two-step UDP
+      Probe + HTTP WS-Transfer Get (via WinINet) for FriendlyName, with
+      a small tag-extraction helper rather than a full SOAP/XML parser.
+      Tested with unit tests and against a simulated server under wine;
+      not yet run against a real Windows machine's WSD responder.
 
-  [ ] A stricter/more complete mDNS parser with proper DNS-compression
-      and record-structure handling (currently a pragmatic best-effort
-      approach: just extracting the longest printable substring from
-      the reply).
+  [x] A stricter/more complete mDNS parser with proper DNS-compression
+      and record-structure handling. DONE - now walks the question and
+      answer sections honestly, follows 0xC0XX compression pointers,
+      and extracts the name from the first PTR or SRV record found,
+      falling back to the old longest-printable-substring heuristic
+      only if that strict parse comes up empty.
 
 
 ================================================================================
