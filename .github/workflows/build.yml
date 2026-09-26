@@ -1,0 +1,42 @@
+name: Build Windows binaries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scanner.c'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build x64
+        run: |
+          x86_64-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o releases/netscan_x64.exe \
+            -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -ltaskschd -static -static-libgcc
+
+      - name: Build x86
+        run: |
+          i686-w64-mingw32-gcc -O2 -D_WIN32_WINNT=0x0600 scanner.c -o releases/netscan_x86.exe \
+            -lws2_32 -liphlpapi -lwininet -lole32 -loleaut32 -lwbemuuid -lwtsapi32 -ltaskschd -static -static-libgcc
+
+      - name: Commit rebuilt binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add releases/netscan_x64.exe releases/netscan_x86.exe
+          if git diff --cached --quiet; then
+            echo "Binaries unchanged, nothing to commit"
+          else
+            git commit -m "Auto-build: rebuild releases from scanner.c [skip ci]"
+            git push
+          fi
