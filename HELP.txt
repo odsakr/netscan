@@ -585,16 +585,87 @@ don't administer.
     TASK_CREATE_OR_UPDATE, run immediately via IRegisteredTask::Run, and
     polled every 300ms until it stops running or --remote-exec-timeout
     is reached. The task is deleted from the target afterward regardless
-    of outcome - nothing is left behind. Currently reports only the
-    task's exit code, not captured stdout/stderr - redirect output to a
-    file on the target yourself (e.g. `... > C:\Windows\Temp\out.txt`)
-    if you need to inspect it afterward.
+    of outcome - nothing is left behind. By itself, only reports the
+    task's exit code - add --remote-exec-output to also capture what the
+    command printed.
 
     Same TCP-135 pre-check as --wmi/--wts, for the same reason (no
     configurable connect timeout otherwise).
 
 --remote-exec-timeout N (milliseconds, default 15000)
     How long to wait for the remote task to finish before giving up.
+
+--remote-exec-output
+    Captures the command's stdout/stderr instead of just its exit code.
+    The command line actually registered as the task becomes:
+
+        cmd.exe /c chcp 65001>nul & <your command> > "C:\Windows\Temp\
+            ns_<uuid>.out" 2>&1 [& <push step, see below>]
+
+    `chcp 65001` switches that cmd.exe's console codepage to UTF-8
+    before your command runs, so the redirected file comes out UTF-8
+    regardless of the target's regional ANSI/OEM codepage - no need to
+    guess or convert it afterward.
+
+    Getting the file's content back to the scanner is a two-step
+    fallback, tried in order:
+
+    1. Push over TCP (primary). Before the task is even registered,
+       the scanner opens a TCP listener on an OS-assigned ephemeral
+       port and determines its own IP as seen from the target's
+       network segment (via a connect()+getsockname() UDP trick - no
+       packet is actually sent, it just makes the kernel resolve the
+       outbound route). The registered command then gets an extra
+       step appended: a `powershell -Command "..."` one-liner that
+       reads the just-written file, opens its own outbound
+       Net.Sockets.TcpClient connection back to the scanner's
+       IP:port, writes the file's bytes, and deletes the file - all
+       wrapped in try/catch{} so any failure here (PowerShell blocked,
+       egress filtered, etc.) just means nothing arrives, silently.
+       Once the task's state stops being TASK_STATE_RUNNING, the
+       scanner accepts on that listener for up to 3 more seconds
+       (filtering by source IP, in case something else connects to
+       the ephemeral port first) and reads until the target closes
+       the connection.
+       This needs no SMB/share access at all - only an outbound TCP
+       connection from the target back to the scanner on that one
+       ephemeral port, which many networks permit even when
+       inter-workstation SMB is locked down.
+
+    2. ADMIN$ share read (fallback). If nothing was received via the
+       push step within its window, the scanner falls back to reading
+       the same file directly from \\<target>\ADMIN$\Temp\ns_<uuid>.out
+       (ADMIN$ always maps to %WINDIR%, i.e. C:\Windows) via a plain
+       CreateFileW/ReadFile, impersonating with the same
+       LOGON32_LOGON_NEW_CREDENTIALS trick as --wts if --wmi-user was
+       given. Requires SMB (port 445) and admin-share access to be
+       reachable - which most environments that already allow Task
+       Scheduler registration also allow, but not always (some harden
+       admin shares independently). Deletes the file after a
+       successful read.
+
+    If BOTH fail, the error message names the exact leftover path
+    (C:\Windows\Temp\ns_<uuid>.out) so it can be retrieved by hand.
+
+    Output is shown as a dedicated "Remote-exec output:" block, one
+    captured line per output line (CRLF from cmd.exe is normalized to
+    a plain newline), indented under the "Remote-exec: выполнено, код
+    возврата N" line. Empty output (command produced nothing) prints
+    as "(пусто)" rather than an empty block. If BOTH read attempts
+    genuinely failed, a "Remote-exec output: не удалось прочитать
+    (...)" line explains why instead.
+
+--remote-exec-output-size N (bytes, default 4096, min 256, max 1048576)
+    Caps how much of the captured output is kept. Longer output is
+    truncated (a byte buffer is allocated once per host that used
+    --remote-exec-output, so raising this multiplies memory use by
+    host count - keep it reasonable for large scans). If truncated, a
+    "Remote-exec output: усечено до N байт" note is added after the
+    block. The full output still exists in the file on the target
+    itself if the push step's `Remove-Item` didn't run (i.e. whenever
+    the fallback share read - not the push - is what actually
+    succeeded); if the push step DID succeed, the target-side file is
+    already gone regardless of truncation on this end.
 
 --enable-discovery
     A canned --remote-exec script that turns on Network Discovery/
@@ -611,7 +682,9 @@ don't administer.
     ("Обнаружение сети" on a Russian system, "Network Discovery" on an
     English one) and Name is not. Mutually exclusive with --remote-exec
     in practice - if both are given, --enable-discovery's canned script
-    takes priority.
+    takes priority. --remote-exec-output has no effect combined with
+    --enable-discovery - the canned script's own output was never
+    meant to be inspected, only its success/failure.
 
 --wsd
     Turns on --info automatically. Queries WS-Discovery (UDP 3702) -
@@ -688,6 +761,7 @@ don't administer.
           WTS logon time: ...
           WTS idle: N.N min.
           Remote-exec: done, exit code N     (only with --remote-exec/--enable-discovery)
+          Remote-exec output: ...            (only with --remote-exec-output; multi-line block)
         ******************************************************************
         ip
           ...
@@ -822,8 +896,23 @@ Discussed but NOT YET IMPLEMENTED:
         "run something once on the target and collect the result"
         channel (--remote-exec). DONE - registers a SYSTEM-principal task
         running cmd.exe /c <command>, runs it immediately, polls for
-        completion, deletes it afterward regardless of outcome. Only
-        the exit code is reported, not captured stdout/stderr yet.
+        completion, deletes it afterward regardless of outcome. Exit
+        code always reported; --remote-exec-output additionally
+        captures stdout/stderr via a TCP push-back step appended to the
+        same task (target opens its own outbound connection to the
+        scanner and sends the redirected file's content), falling back
+        to reading the file through the ADMIN$ share if the push
+        doesn't arrive - see HELP.txt's own --remote-exec-output entry
+        above for the full mechanism. This was the "weakest point" this
+        TODO used to flag; both read paths are new and, like the rest
+        of --remote-exec, only exercised so far against simulated/
+        closed-port conditions under wine (the TCP push/listen logic
+        itself was additionally unit-tested standalone under wine - a
+        fake "target" thread connecting back and sending bytes,
+        exercising the success, timeout, and wrong-source-IP-filter
+        paths - but the actual PowerShell one-liner that runs the real
+        push on a real target, and the ADMIN$ fallback, are both still
+        unvalidated against a real Windows machine).
 
   [x] Remote configuration, specifically enabling Network
         Discovery/NetBIOS/LLMNR firewall rules (--enable-discovery).

@@ -155,6 +155,8 @@ static int g_wsd_mode = 0; /* --wsd: WS-Discovery (то же, чем польз�
 static char g_remote_exec_cmd[1024] = "";
 static int g_remote_exec_timeout_ms = 15000;
 static int g_enable_discovery = 0;
+static int g_remote_exec_capture = 0;      /* --remote-exec-output: захватывать stdout/stderr */
+static int g_remote_exec_output_cap = 4096; /* --remote-exec-output-size N: лимит буфера в байтах */
 static int g_update_oui_only = 0;   /* --update-oui: только скачать базу OUI и выйти */
 #define OUI_URL "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes"
 
@@ -215,6 +217,10 @@ typedef struct {
     int has_remote_exec;
     char remote_exec_error[160];
     LONG remote_exec_code; /* код возврата задачи */
+    int has_remote_exec_output;     /* вывод успешно прочитан (может быть и пустым) */
+    char *remote_exec_output;       /* malloc'd буфер размера g_remote_exec_output_cap, NULL если не запрошено/не удалось */
+    int remote_exec_output_truncated;
+    char remote_exec_output_error[220]; /* причина, если --remote-exec-output запрошен, но прочитать не вышло */
     const char *device_guess;
 } HostInfo;
 
@@ -2269,8 +2275,209 @@ static const char *DISCOVERY_ENABLE_CMD =
     "Set-Service -Name upnphost -StartupType Automatic -ErrorAction SilentlyContinue; "
     "Start-Service upnphost -ErrorAction SilentlyContinue\"";
 
+/* Читает файл из C:\Windows\Temp на цели через админ-шару ADMIN$ (она
+   всегда указывает на %WINDIR%, т.е. ADMIN$\Temp == C:\Windows\Temp на
+   подавляющем большинстве машин - если Windows стоит не на диске C:,
+   ADMIN$ всё равно корректно укажет на реальную папку Windows). Та же
+   пара LogonUserW(LOGON32_LOGON_NEW_CREDENTIALS)+ImpersonateLoggedOnUser,
+   что и в --wts - учётные данные подставляются только для исходящих
+   сетевых обращений (SMB в данном случае), без локальной проверки
+   пароля. Требует тех же прав, что и сама регистрация задачи в Task
+   Scheduler (--remote-exec уже предполагает admin-эквивалентный
+   доступ), так что не добавляет нового требования к правам. Файл на
+   цели удаляется после успешного чтения - не оставляем следов. */
+static int read_remote_temp_file(uint32_t ip_h, const wchar_t *filename_only,
+                                  char *out, size_t out_cap, int *truncated_out,
+                                  char *err_out, size_t err_cap) {
+    out[0] = 0;
+    if (truncated_out) *truncated_out = 0;
+    err_out[0] = 0;
+
+    char ipstr[64];
+    u32_to_ip_str(ip_h, ipstr, sizeof(ipstr));
+    wchar_t wip[64];
+    ascii_to_wide(ipstr, wip, sizeof(wip) / sizeof(wchar_t));
+
+    wchar_t unc[600];
+    _snwprintf(unc, sizeof(unc) / sizeof(wchar_t), L"\\\\%s\\ADMIN$\\Temp\\%s", wip, filename_only);
+    unc[sizeof(unc) / sizeof(wchar_t) - 1] = 0;
+
+    HANDLE hImpToken = NULL;
+    int impersonating = 0;
+    if (g_wmi_user[0]) {
+        wchar_t wuser[128], wdomain[128], wpass[128];
+        ascii_to_wide(g_wmi_user, wuser, 128);
+        ascii_to_wide(g_wmi_password, wpass, 128);
+        wcscpy(wdomain, g_wmi_domain[0] ? L"" : L".");
+        if (g_wmi_domain[0]) ascii_to_wide(g_wmi_domain, wdomain, 128);
+
+        if (!LogonUserW(wuser, wdomain, wpass, LOGON32_LOGON_NEW_CREDENTIALS,
+                         LOGON32_PROVIDER_WINNT50, &hImpToken)) {
+            snprintf(err_out, err_cap, "LogonUser: 0x%08lX", GetLastError());
+            return 0;
+        }
+        if (!ImpersonateLoggedOnUser(hImpToken)) {
+            snprintf(err_out, err_cap, "ImpersonateLoggedOnUser: 0x%08lX", GetLastError());
+            CloseHandle(hImpToken);
+            return 0;
+        }
+        impersonating = 1;
+    }
+
+    int ok = 0;
+    HANDLE hFile = CreateFileW(unc, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD got = 0;
+        DWORD want = (DWORD)(out_cap > 1 ? out_cap - 1 : 0);
+        if (ReadFile(hFile, out, want, &got, NULL)) {
+            out[got] = 0;
+            ok = 1;
+            /* один дополнительный байт - узнать, был ли файл длиннее буфера */
+            char extra[1];
+            DWORD got2 = 0;
+            if (ReadFile(hFile, extra, 1, &got2, NULL) && got2 > 0 && truncated_out) {
+                *truncated_out = 1;
+            }
+        } else {
+            snprintf(err_out, err_cap, "ReadFile: 0x%08lX", GetLastError());
+        }
+        CloseHandle(hFile);
+        DeleteFileW(unc); /* best-effort - не страшно, если не получится */
+    } else {
+        snprintf(err_out, err_cap, "CreateFile(%%WINDIR%%\\Temp\\...): 0x%08lX", GetLastError());
+    }
+
+    if (impersonating) {
+        RevertToSelf();
+        CloseHandle(hImpToken);
+    }
+    return ok;
+}
+
+/* Определяет, какой ИМЕННО локальный IP увидит цель, если мы обратимся
+   к ней - через классический трюк connect()+getsockname() на UDP-сокете
+   (реальный пакет при этом не уходит, ядро просто выбирает исходящий
+   интерфейс по таблице маршрутизации). Нужен на случай нескольких
+   сетевых адаптеров у машины со сканером - угадывать вручную нельзя. */
+static uint32_t get_local_ip_toward(uint32_t target_ip_h) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(53);
+    addr.sin_addr.s_addr = htonl(target_ip_h);
+    uint32_t result = 0;
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        struct sockaddr_in local;
+        int len = sizeof(local);
+        if (getsockname(s, (struct sockaddr *)&local, &len) == 0) {
+            result = ntohl(local.sin_addr.s_addr);
+        }
+    }
+    closesocket(s);
+    return result;
+}
+
+/* Слушающий TCP-сокет на случайном свободном порту (ОС сама выбирает -
+   так не нужно ни настраивать порт руками, ни городить общий на все
+   потоки: у каждого вызова --remote-exec-output свой собственный сокет,
+   поэтому потокам вообще не нужно ничего между собой координировать). */
+static int start_push_listener(SOCKET *out_sock, uint16_t *out_port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) { closesocket(s); return 0; }
+    if (listen(s, 4) != 0) { closesocket(s); return 0; }
+    struct sockaddr_in got;
+    int glen = sizeof(got);
+    if (getsockname(s, (struct sockaddr *)&got, &glen) != 0) { closesocket(s); return 0; }
+    *out_sock = s;
+    *out_port = ntohs(got.sin_port);
+    return 1;
+}
+
+/* Ждёт входящее соединение от цели (задача на ней сама открывает TCP-
+   сессию к нам и шлёт содержимое временного файла - см. wargs ниже) и
+   вычитывает из него всё, что цель отправит, до закрытия соединения.
+   Слушающий сокет закрывается здесь же независимо от результата -
+   вызывающему коду больше не нужно о нём заботиться. Фильтруем по IP
+   отправителя (backlog=4) - на случай, если на этот порт случайно
+   постучится кто-то другой раньше настоящей цели. */
+static int accept_push_and_read(SOCKET listen_sock, uint32_t expect_ip_h, int timeout_ms,
+                                 char *out, size_t out_cap, int *truncated_out) {
+    out[0] = 0;
+    if (truncated_out) *truncated_out = 0;
+    if (listen_sock == INVALID_SOCKET) return 0;
+
+    DWORD deadline = GetTickCount() + (DWORD)(timeout_ms > 0 ? timeout_ms : 3000);
+    SOCKET conn = INVALID_SOCKET;
+    while (1) {
+        DWORD now = GetTickCount();
+        if (now >= deadline) break;
+        DWORD left = deadline - now;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(listen_sock, &rfds);
+        struct timeval tv;
+        tv.tv_sec = left / 1000;
+        tv.tv_usec = (left % 1000) * 1000;
+        int sel = select(0, &rfds, NULL, NULL, &tv);
+        if (sel <= 0 || !FD_ISSET(listen_sock, &rfds)) break;
+
+        struct sockaddr_in peer;
+        int plen = sizeof(peer);
+        SOCKET c = accept(listen_sock, (struct sockaddr *)&peer, &plen);
+        if (c == INVALID_SOCKET) break;
+        if (ntohl(peer.sin_addr.s_addr) != expect_ip_h) {
+            closesocket(c); /* не та машина - ждём дальше в пределах таймаута */
+            continue;
+        }
+        conn = c;
+        break;
+    }
+    closesocket(listen_sock);
+    if (conn == INVALID_SOCKET) return 0;
+
+    size_t total = 0;
+    while (total + 1 < out_cap) {
+        DWORD now = GetTickCount();
+        if (now >= deadline) break;
+        DWORD left = deadline - now;
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(conn, &rfds);
+        struct timeval tv;
+        tv.tv_sec = left / 1000;
+        tv.tv_usec = (left % 1000) * 1000;
+        int sel = select(0, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) break;
+
+        int n = recv(conn, out + total, (int)(out_cap - 1 - total), 0);
+        if (n <= 0) break; /* 0 = цель закрыла соединение (нормальное завершение передачи) */
+        total += (size_t)n;
+    }
+    out[total] = 0;
+    if (truncated_out && total + 1 >= out_cap) {
+        char extra[1];
+        if (recv(conn, extra, 1, 0) > 0) *truncated_out = 1;
+    }
+    closesocket(conn);
+    return 1; /* соединение состоялось и было принято именно от цели - это успех, даже если данных 0 байт */
+}
+
 static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout_ms,
-                             char *err_out, size_t err_cap, LONG *exit_code_out) {
+                             char *err_out, size_t err_cap, LONG *exit_code_out,
+                             int capture_output, char *output_out, size_t output_cap,
+                             int *output_truncated_out, char *output_err_out, size_t output_err_cap,
+                             int *output_ok_out) {
     err_out[0] = 0;
 
     if (!tcp_check(ip_h, 135, 700)) {
@@ -2362,13 +2569,63 @@ static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout
         IAction_QueryInterface(pAction, &IID_IExecAction, (void **)&pExec);
         IAction_Release(pAction);
     }
+    wchar_t woutfile[64]; /* только имя файла, без пути - нужно и здесь, и после ожидания задачи */
+    woutfile[0] = 0;
+    SOCKET push_sock = INVALID_SOCKET;
+    uint32_t push_my_ip = 0;
+    uint16_t push_port = 0;
+    int have_push_listener = 0;
+    if (capture_output) {
+        push_my_ip = get_local_ip_toward(ip_h);
+        if (push_my_ip) have_push_listener = start_push_listener(&push_sock, &push_port);
+    }
     if (pExec) {
         BSTR bPath = SysAllocString(L"cmd.exe");
         wchar_t wcmd[1024];
         ascii_to_wide(command_line, wcmd, 1024);
-        wchar_t wargs[1200];
-        wcscpy(wargs, L"/c ");
-        wcscat(wargs, wcmd);
+        wchar_t wargs[2048];
+        if (capture_output) {
+            char uuid[48];
+            generate_uuid_string(uuid, sizeof(uuid));
+            wchar_t wuuid[48];
+            ascii_to_wide(uuid, wuuid, 48);
+            _snwprintf(woutfile, sizeof(woutfile) / sizeof(wchar_t), L"ns_%s.out", wuuid);
+            woutfile[sizeof(woutfile) / sizeof(wchar_t) - 1] = 0;
+            /* "chcp 65001" переключает кодовую страницу консоли этого cmd.exe
+               на UTF-8 ДО запуска команды пользователя - большинство штатных
+               утилит и PowerShell честно пишут вывод уже в UTF-8, так что
+               файл можно потом читать без гадания про текущую ANSI/OEM
+               кодовую страницу целевой машины. */
+            if (have_push_listener) {
+                char myipstr[64];
+                u32_to_ip_str(push_my_ip, myipstr, sizeof(myipstr));
+                wchar_t wmyip[64];
+                ascii_to_wide(myipstr, wmyip, sizeof(wmyip) / sizeof(wchar_t));
+                /* После записи файла отдельным PowerShell-шагом читаем его
+                   и сами отправляем содержимое нам по TCP на push_port -
+                   в обход админ-шары (SMB может быть закрыт файрволом/
+                   политикой даже когда Task Scheduler/RPC доступен). Файл
+                   при этом удаляем сами - если push прошёл успешно, читать
+                   его через шару уже не нужно. try/catch{} - если этот шаг
+                   не удался (сеть/файрвол/что угодно), просто ничего не
+                   произойдёт, и мы упадём на фоллбэк через ADMIN$. */
+                _snwprintf(wargs, sizeof(wargs) / sizeof(wchar_t),
+                           L"/c chcp 65001>nul & %s > \"C:\\Windows\\Temp\\%s\" 2>&1 & "
+                           L"powershell -NoProfile -Command "
+                           L"\"try { $c=[IO.File]::ReadAllBytes('C:\\Windows\\Temp\\%s'); "
+                           L"$tc=New-Object Net.Sockets.TcpClient; $tc.Connect('%s',%d); "
+                           L"$s=$tc.GetStream(); $s.Write($c,0,$c.Length); $s.Close(); $tc.Close(); "
+                           L"Remove-Item 'C:\\Windows\\Temp\\%s' -Force } catch {}\"",
+                           wcmd, woutfile, woutfile, wmyip, (int)push_port, woutfile);
+            } else {
+                _snwprintf(wargs, sizeof(wargs) / sizeof(wchar_t),
+                           L"/c chcp 65001>nul & %s > \"C:\\Windows\\Temp\\%s\" 2>&1",
+                           wcmd, woutfile);
+            }
+        } else {
+            _snwprintf(wargs, sizeof(wargs) / sizeof(wchar_t), L"/c %s", wcmd);
+        }
+        wargs[sizeof(wargs) / sizeof(wchar_t) - 1] = 0;
         BSTR bArgs = SysAllocString(wargs);
         IExecAction_put_Path(pExec, bPath);
         IExecAction_put_Arguments(pExec, bArgs);
@@ -2391,6 +2648,7 @@ static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout
         SysFreeString(bTaskName);
         ITaskFolder_Release(pFolder);
         ITaskService_Release(pService);
+        if (push_sock != INVALID_SOCKET) closesocket(push_sock);
         return 0;
     }
 
@@ -2401,6 +2659,7 @@ static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout
     hr = IRegisteredTask_Run(pRegTask, vRunParams, &pRunning);
     if (FAILED(hr)) {
         snprintf(err_out, err_cap, "Run: 0x%08lX", (unsigned long)hr);
+        if (push_sock != INVALID_SOCKET) closesocket(push_sock);
     } else {
         /* опрашиваем состояние задачи с шагом 300мс до завершения или таймаута */
         DWORD waited = 0;
@@ -2418,6 +2677,47 @@ static int task_remote_exec(uint32_t ip_h, const char *command_line, int timeout
             snprintf(err_out, err_cap, "не удалось получить результат задачи (таймаут %d мс?)", timeout_ms);
         }
         if (pRunning) IRunningTask_Release(pRunning);
+
+        /* Читаем вывод независимо от exitCode (ненулевой код возврата не
+           значит, что команда молчала - наоборот, обычно самое интересное
+           в выводе как раз при ошибке). Читаем, даже если ok==0 из-за
+           таймаута ожидания статуса задачи - сама команда на цели вполне
+           могла успеть отработать и записать файл до истечения нашего
+           --remote-exec-timeout.
+
+           Сначала пробуем push-канал (задача сама прислала нам данные по
+           TCP - см. wargs выше), и только если он не сработал (файрвол,
+           политика, PowerShell недоступен и т.п.) - фоллбэк через
+           ADMIN$-шару поверх того же файла. Если не сработало ни то, ни
+           другое, файл остаётся на целевой машине - хоть что-то, что
+           можно будет забрать вручную. */
+        if (capture_output && woutfile[0] && output_out) {
+            int got_output = 0;
+            if (have_push_listener) {
+                /* к моменту, когда задача уже TASK_STATE-завершена, push
+                   (если он вообще состоится) обычно приходит почти сразу -
+                   секунды хватает с большим запасом, не тянем время сверх
+                   уже потраченного на --remote-exec-timeout */
+                got_output = accept_push_and_read(push_sock, ip_h, 3000,
+                                                   output_out, output_cap, output_truncated_out);
+                push_sock = INVALID_SOCKET; /* accept_push_and_read сама закрыла сокет */
+            }
+            if (!got_output) {
+                got_output = read_remote_temp_file(ip_h, woutfile, output_out, output_cap,
+                                                     output_truncated_out, output_err_out, output_err_cap);
+            }
+            if (!got_output && output_err_out && output_err_cap) {
+                char outfile_narrow[64];
+                WideCharToMultiByte(CP_UTF8, 0, woutfile, -1, outfile_narrow, sizeof(outfile_narrow), NULL, NULL);
+                size_t curlen = strlen(output_err_out);
+                if (curlen + 2 < output_err_cap) {
+                    snprintf(output_err_out + curlen, output_err_cap - curlen,
+                             "; файл может остаться на цели: C:\\Windows\\Temp\\%s", outfile_narrow);
+                }
+            }
+            if (output_ok_out) *output_ok_out = got_output;
+        }
+        if (push_sock != INVALID_SOCKET) closesocket(push_sock); /* захват не запрашивался/не пригодился */
     }
 
     /* подчищаем за собой - не оставляем задачу на целевой машине */
@@ -2499,11 +2799,22 @@ static void gather_host_info(HostInfo *hi) {
     if (g_enable_discovery || g_remote_exec_cmd[0]) {
         const char *cmd = g_enable_discovery ? DISCOVERY_ENABLE_CMD : g_remote_exec_cmd;
         LONG code = -1;
+        int output_ok = 0;
+        if (g_remote_exec_capture) {
+            hi->remote_exec_output = (char *)malloc((size_t)g_remote_exec_output_cap);
+            if (hi->remote_exec_output) hi->remote_exec_output[0] = 0;
+        }
         if (task_remote_exec(hi->ip, cmd, g_remote_exec_timeout_ms,
-                              hi->remote_exec_error, sizeof(hi->remote_exec_error), &code)) {
+                              hi->remote_exec_error, sizeof(hi->remote_exec_error), &code,
+                              g_remote_exec_capture && hi->remote_exec_output,
+                              hi->remote_exec_output, (size_t)g_remote_exec_output_cap,
+                              &hi->remote_exec_output_truncated,
+                              hi->remote_exec_output_error, sizeof(hi->remote_exec_output_error),
+                              &output_ok)) {
             hi->has_remote_exec = 1;
             hi->remote_exec_code = code;
         }
+        hi->has_remote_exec_output = output_ok;
     }
 
     hi->device_guess = guess_device_by_ports(hi->ip);
@@ -2601,6 +2912,40 @@ static int host_info_cmp_by_os(const void *a, const void *b) {
     if (c != 0) return c;
     if (ha->ip != hb->ip) return (ha->ip < hb->ip) ? -1 : 1;
     return 0;
+}
+
+/* Печатает захваченный вывод --remote-exec построчно, с отступом, и в
+   консоль, и в файл результатов - убирая \r от CRLF-окончаний строк
+   (cmd.exe на цели пишет именно CRLF). Пустой вывод (команда ничего не
+   вывела) - отдельная короткая строка, а не пустой блок. */
+static void print_remote_exec_output(const char *text, FILE *f) {
+    if (!text || !text[0]) {
+        conprintf("  Remote-exec output: (пусто)\n");
+        if (f) fprintf(f, "  Remote-exec output: (пусто)\n");
+        return;
+    }
+    conprintf("  Remote-exec output:\n");
+    if (f) fprintf(f, "  Remote-exec output:\n");
+
+    size_t len = strlen(text);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return;
+    memcpy(copy, text, len + 1);
+
+    char *line = copy;
+    for (char *p = copy; ; p++) {
+        if (*p == '\n' || *p == 0) {
+            int end = (*p == 0);
+            *p = 0;
+            size_t llen = strlen(line);
+            if (llen > 0 && line[llen - 1] == '\r') line[llen - 1] = 0;
+            conprintf("    %s\n", line);
+            if (f) fprintf(f, "    %s\n", line);
+            if (end) break;
+            line = p + 1;
+        }
+    }
+    free(copy);
 }
 
 static void print_host_info_section(FILE *f) {
@@ -2734,6 +3079,20 @@ static void print_host_info_section(FILE *f) {
         if (hi->has_remote_exec) {
             conprintf("  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
             if (f) fprintf(f, "  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
+            if (g_remote_exec_capture) {
+                if (hi->has_remote_exec_output) {
+                    print_remote_exec_output(hi->remote_exec_output ? hi->remote_exec_output : "", f);
+                    if (hi->remote_exec_output_truncated) {
+                        conprintf("  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                                  g_remote_exec_output_cap);
+                        if (f) fprintf(f, "  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                                       g_remote_exec_output_cap);
+                    }
+                } else if (hi->remote_exec_output_error[0]) {
+                    conprintf("  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
+                    if (f) fprintf(f, "  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
+                }
+            }
         } else if ((g_enable_discovery || g_remote_exec_cmd[0]) && hi->remote_exec_error[0]) {
             conprintf("  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
             if (f) fprintf(f, "  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
@@ -3341,6 +3700,15 @@ static void print_usage(const char *prog) {
         "                     ограничения, которые могли бы зарубить прямой RPC. Те же\n"
         "                     учётные данные --wmi-user/--wmi-password/--wmi-domain.\n"
         "  --remote-exec-timeout N  сколько мс ждать завершения задачи (по умолчанию 15000).\n"
+        "  --remote-exec-output  захватить stdout/stderr команды из --remote-exec.\n"
+        "                        Два способа получить их с цели: (1) задача сама шлёт\n"
+        "                        файл нам обратно по TCP на случайный порт (PowerShell,\n"
+        "                        без общих папок); (2) если это не удалось - чтение файла\n"
+        "                        через ADMIN$-шару (те же учётные данные, что и выше).\n"
+        "                        Если не сработало оба способа, файл остаётся на цели в\n"
+        "                        C:\\Windows\\Temp - путь будет показан в ошибке.\n"
+        "  --remote-exec-output-size N  макс. размер захваченного вывода в байтах\n"
+        "                                (по умолчанию 4096, лишнее отбрасывается).\n"
         "  --enable-discovery  включить NetBIOS/LLMNR/Network Discovery через Task\n"
         "                      Scheduler (Enable-NetFirewallRule по маске имени NETDIS*,\n"
         "                      локаль-независимо, плюс попытка поднять сопутствующие\n"
@@ -3426,6 +3794,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--remote-exec-timeout") == 0 && i + 1 < argc) {
             g_remote_exec_timeout_ms = atoi(argv[++i]);
             if (g_remote_exec_timeout_ms < 1000) g_remote_exec_timeout_ms = 1000;
+        } else if (strcmp(argv[i], "--remote-exec-output") == 0) {
+            g_remote_exec_capture = 1;
+        } else if (strcmp(argv[i], "--remote-exec-output-size") == 0 && i + 1 < argc) {
+            g_remote_exec_output_cap = atoi(argv[++i]);
+            if (g_remote_exec_output_cap < 256) g_remote_exec_output_cap = 256;
+            if (g_remote_exec_output_cap > 1048576) g_remote_exec_output_cap = 1048576;
         } else if (strcmp(argv[i], "--enable-discovery") == 0) {
             g_enable_discovery = 1;
             g_info_mode = 1;

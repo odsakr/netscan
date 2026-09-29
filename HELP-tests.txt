@@ -459,8 +459,10 @@ it at.
       target machine afterward that C:\Windows\Temp\netscan_test.txt
       was actually created and contains the SYSTEM account name (since
       the task runs as SYSTEM, not as whichever account you authenticated
-      with) - this is the current way to inspect output, since exit-code
-      only is reported directly by the tool (see HELP.txt section 7).
+      with). This test intentionally does its own redirection rather than
+      using --remote-exec-output (section 11.6+ below) - useful as a
+      baseline to confirm the task itself ran correctly, independent of
+      whether output capture is working.
 
 11.2  Explicit credentials
 
@@ -517,6 +519,87 @@ it at.
       session, Remote-exec result) appear for the same host without
       interfering with each other - confirms the shared COM
       initialization across all three code paths is correct.
+
+11.6  --remote-exec-output: basic capture (push channel should work
+      on a normal LAN with no unusual firewall/policy restrictions)
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "whoami & echo second line"
+                      --remote-exec-output
+
+      Expect: "Remote-exec: выполнено, код возврата 0" followed by a
+      "Remote-exec output:" block with two indented lines (the SYSTEM
+      account name, then "second line"). Afterward, confirm there is
+      NO leftover C:\Windows\Temp\ns_*.out file on the target - the
+      push step's own Remove-Item should have cleaned it up on success.
+      A leftover file after a *successful* capture would mean the push
+      script ran but didn't get to (or skipped) its cleanup step - worth
+      reporting as a bug.
+
+      Also worth checking on the scanning machine itself: does Windows
+      Firewall show an "allow this app" prompt the first time
+      netscan_x64.exe opens its push listener? If so, on a managed/
+      corporate scanning machine, --remote-exec-output may need
+      netscan_x64.exe pre-approved for inbound connections (or the
+      prompt answered) before it can work unattended.
+
+11.7  --remote-exec-output: forcing the ADMIN$ fallback
+
+      Temporarily block the push channel - e.g. a local outbound
+      firewall rule on the target blocking powershell.exe, or blocking
+      the scanner's IP/high ports outbound - then repeat 11.6.
+
+      Expect: the same successful result and output content as 11.6,
+      but via the ADMIN$ share fallback this time. From the outside
+      this looks identical to 11.6 (the tool doesn't currently say
+      which of the two channels actually delivered the data) - to be
+      sure the fallback path specifically is what's being exercised,
+      confirm via a packet capture or connection log on the scanner
+      that no successful inbound connection was made to the push
+      listener's port during this run.
+
+11.8  --remote-exec-output: both channels blocked
+
+      On top of 11.7's block, also cut off SMB/ADMIN$ access - e.g.
+      temporarily disable File and Printer Sharing, or block port 445,
+      or restrict admin-share access via local policy - then repeat.
+
+      Expect: "Remote-exec: выполнено, код возврата 0" (the command
+      itself still ran and exited fine) followed by "Remote-exec
+      output: не удалось прочитать (...)", with the error text naming
+      the leftover path (C:\Windows\Temp\ns_<uuid>.out). Confirm that
+      file actually exists at that path on the target with the
+      expected content, then clean it up by hand - the tool never
+      managed to read it, so it never got the chance to delete it
+      either.
+
+11.9  --remote-exec-output-size: truncation
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "dir C:\Windows\System32 /s"
+                      --remote-exec-output --remote-exec-output-size 256
+
+      Expect: the output block contains only ~256 bytes worth of
+      content (cut off mid-line is fine/expected), followed by a
+      "Remote-exec output: усечено до 256 байт (см.
+      --remote-exec-output-size)" note. Confirms the truncation
+      detection (the "one extra byte" read past the buffer) works via
+      whichever channel actually delivered the data.
+
+11.10 --remote-exec-output: empty output + non-zero exit code together
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --remote-exec "exit /b 3" --remote-exec-output
+
+      Expect: "Remote-exec: выполнено, код возврата 3" followed by
+      "Remote-exec output: (пусто)" - confirms a non-zero exit code
+      doesn't suppress or interfere with output capture, and that
+      genuinely empty output is shown as an explicit "(пусто)" marker
+      rather than a blank/missing block that could be mistaken for a
+      read failure.
 
 
 ================================================================================
@@ -646,6 +729,19 @@ NOTES FOR WHOEVER RUNS THIS
   exercised against a wine-hosted simulated server, never a real mDNS
   responder or WS-Discovery device - worth extra scrutiny on the first
   real run.
+- --remote-exec-output (tests 11.6-11.10) is the newest and least-tested
+  piece of the tool. Its TCP push/accept logic (the listener, the
+  source-IP filter, the timeout path) was unit-tested standalone under
+  wine with a fake local "target" thread and passed all three cases
+  (successful receive, timeout with nobody connecting, wrong-source-IP
+  rejection) - but the actual PowerShell one-liner that a REAL target
+  runs to read its own output file and push it back has never executed
+  on a real Windows machine, and neither has the ADMIN$ fallback read.
+  Give tests 11.6-11.10 particularly careful attention, in order: 11.6
+  confirms the push channel works AND cleans up after itself, 11.7
+  confirms the fallback kicks in correctly when push is blocked, 11.8
+  confirms a clean, honest failure (with the right leftover-file path
+  in the error) when both are blocked.
 - Always compare a new build's results against a known-good previous
   run when in doubt - most of these tests are about catching
   regressions, not proving correctness from a blank slate.

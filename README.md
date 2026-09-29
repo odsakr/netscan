@@ -39,7 +39,9 @@ Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt)
 - Fail-safe remote execution via Task Scheduler (`--remote-exec`,
   `--enable-discovery`) — runs a command locally on the target as
   SYSTEM, so it isn't blocked by whatever network restriction might
-  stop a direct registry/service RPC call
+  stop a direct registry/service RPC call; `--remote-exec-output`
+  captures stdout/stderr too, via a TCP push-back from the target with
+  an ADMIN$-share read as automatic fallback
 - Flexible output: append mode with timestamps, simultaneous sort-by-IP
   and sort-by-port result files
 
@@ -84,8 +86,7 @@ prompt, just an .exe you can drop anywhere.
 
 See the TODO section at the end of [HELP.txt](HELP.txt) — remaining items
 are a GUI on top of the console core, WinRM as an alternative WMI/WTS
-transport, mining the Security event log for logoff time, and capturing
-`--remote-exec` stdout/stderr instead of just the exit code.
+transport, and mining the Security event log for logoff time.
 
 ## License
 
