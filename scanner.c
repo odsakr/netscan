@@ -157,6 +157,9 @@ static int g_remote_exec_timeout_ms = 15000;
 static int g_enable_discovery = 0;
 static int g_remote_exec_capture = 0;      /* --remote-exec-output: захватывать stdout/stderr */
 static int g_remote_exec_output_cap = 4096; /* --remote-exec-output-size N: лимит буфера в байтах */
+static int g_logoff_query = 0;             /* --logoff-time: канонический запрос логоффа/дисконнекта */
+static int g_logoff_time_count = 20;       /* --logoff-time-count N: сколько последних событий брать */
+static char g_logoff_query_cmd[512] = "";  /* собирается после разбора argv, см. main() */
 static int g_update_oui_only = 0;   /* --update-oui: только скачать базу OUI и выйти */
 #define OUI_URL "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes"
 
@@ -2796,17 +2799,18 @@ static void gather_host_info(HostInfo *hi) {
         wts_query_host(hi->ip, hi);
     }
 
-    if (g_enable_discovery || g_remote_exec_cmd[0]) {
-        const char *cmd = g_enable_discovery ? DISCOVERY_ENABLE_CMD : g_remote_exec_cmd;
+    if (g_enable_discovery || g_remote_exec_cmd[0] || g_logoff_query) {
+        const char *cmd = g_enable_discovery ? DISCOVERY_ENABLE_CMD :
+                           (g_logoff_query ? g_logoff_query_cmd : g_remote_exec_cmd);
         LONG code = -1;
         int output_ok = 0;
-        if (g_remote_exec_capture) {
+        if (g_remote_exec_capture || g_logoff_query) {
             hi->remote_exec_output = (char *)malloc((size_t)g_remote_exec_output_cap);
             if (hi->remote_exec_output) hi->remote_exec_output[0] = 0;
         }
         if (task_remote_exec(hi->ip, cmd, g_remote_exec_timeout_ms,
                               hi->remote_exec_error, sizeof(hi->remote_exec_error), &code,
-                              g_remote_exec_capture && hi->remote_exec_output,
+                              (g_remote_exec_capture || g_logoff_query) && hi->remote_exec_output,
                               hi->remote_exec_output, (size_t)g_remote_exec_output_cap,
                               &hi->remote_exec_output_truncated,
                               hi->remote_exec_output_error, sizeof(hi->remote_exec_output_error),
@@ -2826,7 +2830,7 @@ static void wait_for_all_threads(HANDLE *handles, int count); /* определ�
 
 static DWORD WINAPI worker_info(LPVOID param) {
     (void)param;
-    int need_com = g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0];
+    int need_com = g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0] || g_logoff_query;
     if (need_com) CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     for (;;) {
@@ -2941,6 +2945,60 @@ static void print_remote_exec_output(const char *text, FILE *f) {
             if (llen > 0 && line[llen - 1] == '\r') line[llen - 1] = 0;
             conprintf("    %s\n", line);
             if (f) fprintf(f, "    %s\n", line);
+            if (end) break;
+            line = p + 1;
+        }
+    }
+    free(copy);
+}
+
+/* Печатает результат --logoff-time: разбирает канонические строки вида
+   "ВРЕМЯ|ID_события|ПОЛЬЗОВАТЕЛЬ", которые генерирует g_logoff_query_cmd,
+   в читаемую таблицу. Строка, которая не распознаётся в этом формате
+   (например, текст ошибки PowerShell, если что-то пошло не так), просто
+   печатается как есть - чтобы не проглатывать полезную диагностику. */
+static void print_logoff_events(const char *text, FILE *f) {
+    if (!text || !text[0]) {
+        conprintf("  Событий логоффа/дисконнекта не найдено (журнал пуст либо ничего за этот период)\n");
+        if (f) fprintf(f, "  Событий логоффа/дисконнекта не найдено (журнал пуст либо ничего за этот период)\n");
+        return;
+    }
+    conprintf("  История логоффов/дисконнектов (журнал Security):\n");
+    if (f) fprintf(f, "  История логоффов/дисконнектов (журнал Security):\n");
+
+    size_t len = strlen(text);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) return;
+    memcpy(copy, text, len + 1);
+
+    char *line = copy;
+    for (char *p = copy; ; p++) {
+        if (*p == '\n' || *p == 0) {
+            int end = (*p == 0);
+            *p = 0;
+            size_t llen = strlen(line);
+            if (llen > 0 && line[llen - 1] == '\r') line[llen - 1] = 0;
+            if (line[0]) {
+                char *sep1 = strchr(line, '|');
+                char *sep2 = sep1 ? strchr(sep1 + 1, '|') : NULL;
+                if (sep1 && sep2) {
+                    *sep1 = 0;
+                    *sep2 = 0;
+                    const char *time_s = line;
+                    int id = atoi(sep1 + 1);
+                    const char *user = sep2 + 1;
+                    const char *label =
+                        id == 4634 ? "Выход из системы" :
+                        id == 4647 ? "Выход (иниц. пользователем)" :
+                        id == 4778 ? "Переподключение RDP" :
+                        id == 4779 ? "Отключение RDP" : "Событие";
+                    conprintf("    %-19s  %-32s  %s\n", time_s, label, user);
+                    if (f) fprintf(f, "    %-19s  %-32s  %s\n", time_s, label, user);
+                } else {
+                    conprintf("    %s\n", line);
+                    if (f) fprintf(f, "    %s\n", line);
+                }
+            }
             if (end) break;
             line = p + 1;
         }
@@ -3077,25 +3135,46 @@ static void print_host_info_section(FILE *f) {
             if (f) fprintf(f, "  WTS: не удалось (%s)\n", hi->wts_error);
         }
         if (hi->has_remote_exec) {
-            conprintf("  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
-            if (f) fprintf(f, "  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
-            if (g_remote_exec_capture) {
+            if (g_logoff_query) {
+                /* --logoff-time - отдельная подача, без обычного "Remote-exec:"
+                   заголовка: код возврата powershell.exe сам по себе не несёт
+                   полезной информации для этого режима (0, даже если событий
+                   не нашлось - это не ошибка выполнения) */
                 if (hi->has_remote_exec_output) {
-                    print_remote_exec_output(hi->remote_exec_output ? hi->remote_exec_output : "", f);
+                    print_logoff_events(hi->remote_exec_output ? hi->remote_exec_output : "", f);
                     if (hi->remote_exec_output_truncated) {
-                        conprintf("  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                        conprintf("  История логоффов/дисконнектов: усечено до %d байт (см. --remote-exec-output-size)\n",
                                   g_remote_exec_output_cap);
-                        if (f) fprintf(f, "  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                        if (f) fprintf(f, "  История логоффов/дисконнектов: усечено до %d байт (см. --remote-exec-output-size)\n",
                                        g_remote_exec_output_cap);
                     }
-                } else if (hi->remote_exec_output_error[0]) {
-                    conprintf("  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
-                    if (f) fprintf(f, "  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
+                } else {
+                    conprintf("  История логоффов/дисконнектов: не удалось получить (%s)\n",
+                              hi->remote_exec_output_error[0] ? hi->remote_exec_output_error : "неизвестная ошибка");
+                    if (f) fprintf(f, "  История логоффов/дисконнектов: не удалось получить (%s)\n",
+                                   hi->remote_exec_output_error[0] ? hi->remote_exec_output_error : "неизвестная ошибка");
+                }
+            } else {
+                conprintf("  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
+                if (f) fprintf(f, "  Remote-exec: выполнено, код возврата %ld\n", (long)hi->remote_exec_code);
+                if (g_remote_exec_capture) {
+                    if (hi->has_remote_exec_output) {
+                        print_remote_exec_output(hi->remote_exec_output ? hi->remote_exec_output : "", f);
+                        if (hi->remote_exec_output_truncated) {
+                            conprintf("  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                                      g_remote_exec_output_cap);
+                            if (f) fprintf(f, "  Remote-exec output: усечено до %d байт (см. --remote-exec-output-size)\n",
+                                           g_remote_exec_output_cap);
+                        }
+                    } else if (hi->remote_exec_output_error[0]) {
+                        conprintf("  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
+                        if (f) fprintf(f, "  Remote-exec output: не удалось прочитать (%s)\n", hi->remote_exec_output_error);
+                    }
                 }
             }
-        } else if ((g_enable_discovery || g_remote_exec_cmd[0]) && hi->remote_exec_error[0]) {
-            conprintf("  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
-            if (f) fprintf(f, "  Remote-exec: не удалось (%s)\n", hi->remote_exec_error);
+        } else if ((g_enable_discovery || g_remote_exec_cmd[0] || g_logoff_query) && hi->remote_exec_error[0]) {
+            conprintf("  %s: не удалось (%s)\n", g_logoff_query ? "История логоффов/дисконнектов" : "Remote-exec", hi->remote_exec_error);
+            if (f) fprintf(f, "  %s: не удалось (%s)\n", g_logoff_query ? "История логоффов/дисконнектов" : "Remote-exec", hi->remote_exec_error);
         }
     }
 }
@@ -3707,12 +3786,26 @@ static void print_usage(const char *prog) {
         "                        через ADMIN$-шару (те же учётные данные, что и выше).\n"
         "                        Если не сработало оба способа, файл остаётся на цели в\n"
         "                        C:\\Windows\\Temp - путь будет показан в ошибке.\n"
+        "                        ВАЖНО: на время выполнения открывает входящий порт на\n"
+        "                        ЭТОЙ машине (сканере) - на управляемой по GPO машине\n"
+        "                        обычно бесшумно, на обычном десктопе Windows Firewall\n"
+        "                        может спросить разрешение при первом запуске.\n"
         "  --remote-exec-output-size N  макс. размер захваченного вывода в байтах\n"
         "                                (по умолчанию 4096, лишнее отбрасывается).\n"
         "  --enable-discovery  включить NetBIOS/LLMNR/Network Discovery через Task\n"
         "                      Scheduler (Enable-NetFirewallRule по маске имени NETDIS*,\n"
         "                      локаль-независимо, плюс попытка поднять сопутствующие\n"
         "                      службы). Использует тот же механизм, что --remote-exec.\n"
+        "  --logoff-time    показать историю логоффа/дисконнекта из журнала Security\n"
+        "                   цели (события 4634/4647 - выход из системы, 4778/4779 -\n"
+        "                   переподключение/отключение RDP-сессии). Использует тот же\n"
+        "                   механизм, что --remote-exec/--enable-discovery (Task\n"
+        "                   Scheduler, SYSTEM), автоматически включает захват вывода -\n"
+        "                   отдельный --remote-exec-output не нужен. Для ТЕКУЩИХ\n"
+        "                   активных/отключённых сессий и простоя используй --wts -\n"
+        "                   этот флаг про ИСТОРИЮ прошлых событий из журнала.\n"
+        "  --logoff-time-count N  сколько последних событий брать (по умолчанию 20,\n"
+        "                         от 1 до 500).\n"
         "  --sort-by-port   доп. файл result_by_port.txt с теми же результатами, но\n"
         "                   отсортированными по порту (основной файл по IP не меняется -\n"
         "                   сохраняются оба варианта одновременно).\n"
@@ -3800,6 +3893,13 @@ int main(int argc, char **argv) {
             g_remote_exec_output_cap = atoi(argv[++i]);
             if (g_remote_exec_output_cap < 256) g_remote_exec_output_cap = 256;
             if (g_remote_exec_output_cap > 1048576) g_remote_exec_output_cap = 1048576;
+        } else if (strcmp(argv[i], "--logoff-time") == 0) {
+            g_logoff_query = 1;
+            g_info_mode = 1;
+        } else if (strcmp(argv[i], "--logoff-time-count") == 0 && i + 1 < argc) {
+            g_logoff_time_count = atoi(argv[++i]);
+            if (g_logoff_time_count < 1) g_logoff_time_count = 1;
+            if (g_logoff_time_count > 500) g_logoff_time_count = 500;
         } else if (strcmp(argv[i], "--enable-discovery") == 0) {
             g_enable_discovery = 1;
             g_info_mode = 1;
@@ -3813,6 +3913,25 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 0;
         }
+    }
+
+    if (g_logoff_query) {
+        /* Число событий (--logoff-time-count) подставляется сюда, поэтому
+           строка собирается уже после разбора всех argv, а не как
+           статическая константа вроде DISCOVERY_ENABLE_CMD. Одинарные
+           кавычки для ВСЕХ PowerShell-строковых литералов внутри -Command
+           намеренно - двойные кавычки здесь зарезервированы только под сам
+           аргумент -Command целиком, вложенных двойных кавычек нет вообще,
+           это снимает классическую головную боль с эскейпингом между
+           cmd.exe и powershell.exe. */
+        snprintf(g_logoff_query_cmd, sizeof(g_logoff_query_cmd),
+            "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+            "\"Get-WinEvent -FilterHashtable @{LogName='Security';Id=4634,4647,4778,4779} "
+            "-MaxEvents %d -ErrorAction SilentlyContinue | ForEach-Object { "
+            "$m=[regex]::Match($_.Message,'Account Name:\\s*(\\S+)'); "
+            "$u=if($m.Success){$m.Groups[1].Value}else{'?'}; "
+            "'{0}|{1}|{2}' -f $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $_.Id, $u }\"",
+            g_logoff_time_count);
     }
 
     if (g_update_oui_only) {
@@ -3862,7 +3981,7 @@ int main(int argc, char **argv) {
 
     DWORD t0 = GetTickCount();
 
-    if (g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0]) {
+    if (g_wmi_mode || g_enable_discovery || g_remote_exec_cmd[0] || g_logoff_query) {
         HRESULT hr_com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr_com) || hr_com == S_FALSE) {
             HRESULT hr_sec = CoInitializeSecurity(NULL, -1, NULL, NULL,

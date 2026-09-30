@@ -601,6 +601,73 @@ it at.
       rather than a blank/missing block that could be mistaken for a
       read failure.
 
+11.11 --logoff-time: basic history read
+
+      First, on the target, generate some events to find: log off an
+      interactive session (or just RDP in and disconnect without
+      logging off, for a 4778/4779 pair instead), then:
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5 --logoff-time
+
+      Expect: no "Remote-exec:" line at all (this mode replaces it) -
+      instead "История логоффов/дисконнектов (журнал Security):"
+      followed by one indented line per event, newest first, each as
+      "<timestamp>  <human label>  <account>". Confirm the timestamps
+      and account name(s) match what you just did on the target, and
+      that a logoff shows both a 4647 line ("Выход (иниц.
+      пользователем)") and a 4634 line ("Выход из системы") a moment
+      apart for the same account - that pairing is expected, not a
+      duplicate/bug. Also confirm there is NO leftover
+      C:\Windows\Temp\ns_*.out file on the target afterward, same as
+      11.6 - --logoff-time uses the exact same push/fallback plumbing.
+
+11.12 --logoff-time-count
+
+      netscan_x64.exe --ip 192.168.1.50 --ports 135 --proto tcp
+                      --mode full --threads 5
+                      --logoff-time --logoff-time-count 3
+
+      Expect: at most 3 lines in the output block (across all four
+      event IDs combined, not 3 per ID) - confirms -MaxEvents is being
+      passed through and respected. Repeat with a deliberately large
+      value (e.g. 300) against a target with a lot of Security log
+      history to sanity-check nothing breaks or hangs with a bigger
+      pull - if the resulting text is long enough to hit the default
+      --remote-exec-output-size (4096 bytes), pair it with a larger
+      --remote-exec-output-size and confirm the truncation note still
+      appears correctly in this mode too.
+
+11.13 --logoff-time: no matching events
+
+      Against a target where nothing in the queried event IDs has
+      happened recently (or a freshly rebooted-and-not-yet-used test
+      VM), or by narrowing with a very small --logoff-time-count
+      combined with a target that's had no recent activity:
+
+      Expect: "Событий логоффа/дисконнекта не найдено (журнал пуст
+      либо ничего за этот период)" rather than an empty/blank block -
+      confirms Get-WinEvent finding zero matches (which it treats as a
+      non-terminating condition with -ErrorAction SilentlyContinue,
+      producing no pipeline output at all) is distinguished correctly
+      from a read failure.
+
+11.14 --logoff-time: unreadable/misconfigured Security log (error path)
+
+      Hard to force deliberately without changing the target's actual
+      audit policy, but worth being aware of: if Security log auditing
+      for logon/logoff events is disabled entirely on the target (not
+      the netscan default - a local/domain policy choice), or the log
+      is full and set to not overwrite, Get-WinEvent may return nothing
+      matching even though it should have found events - this would
+      look identical to 11.13's "not found" case from the tool's
+      perspective, since there's no way to distinguish "genuinely no
+      events" from "auditing wasn't capturing them" from the captured
+      text alone. If numbers here look implausibly low compared to
+      known activity on the target, check its audit policy first:
+      (auditpol /get /subcategory:"Logoff","Logon","Other Logon/Logoff Events")
+      before assuming netscan is missing something.
+
 
 ================================================================================
 12. WS-DISCOVERY (--wsd)
@@ -742,6 +809,31 @@ NOTES FOR WHOEVER RUNS THIS
   confirms the fallback kicks in correctly when push is blocked, 11.8
   confirms a clean, honest failure (with the right leftover-file path
   in the error) when both are blocked.
+- --logoff-time (tests 11.11-11.14) is built entirely on top of
+  --remote-exec-output's own machinery (same push/ADMIN$ read paths,
+  same untested status as above), plus one more never-validated piece
+  on top: the PowerShell Get-WinEvent one-liner itself and the
+  time|id|user parsing on this end. The parsing logic specifically
+  (splitting on "|", mapping event IDs to labels, falling back to
+  raw-line printing on unparseable input) WAS unit-tested standalone
+  natively (no wine needed - it's pure string handling, no Win32 APIs
+  involved) against six cases: normal multi-line CRLF output, empty
+  output, an unrecognized event ID, a PowerShell-error-shaped line
+  with no "|" separators, a mix of valid and garbled lines together,
+  and a username containing backslash/dollar-sign characters - all six
+  passed. What's genuinely unverified is everything upstream of that:
+  whether the exact -FilterHashtable/regex/format-string PowerShell
+  syntax used actually runs without error on a real target, and
+  whether the "Account Name:\s*(\S+)" regex reliably matches the real
+  rendered Message text for all four event IDs on a real Security log
+  (the message template wording was written from documentation/
+  memory, not copy-pasted from a live event). Test 11.11 is the one
+  that actually exercises this end-to-end - treat its first real run
+  with real scrutiny, and if the regex doesn't match, the symptom
+  would be "?" printed as the account name rather than a crash or
+  empty result (worth grepping the raw captured file for, if that
+  happens - the timestamp and event ID columns would still be
+  correct even if the account name extraction failed).
 - Always compare a new build's results against a known-good previous
   run when in doubt - most of these tests are about catching
   regressions, not proving correctness from a blank slate.

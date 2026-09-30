@@ -42,6 +42,11 @@ Test checklist for verifying a build: [HELP-tests.txt](HELP-tests.txt)
   stop a direct registry/service RPC call; `--remote-exec-output`
   captures stdout/stderr too, via a TCP push-back from the target with
   an ADMIN$-share read as automatic fallback
+- Logoff/disconnect history (`--logoff-time`) — mines the target's
+  Security event log (4634/4647 logoff, 4778/4779 RDP reconnect/
+  disconnect) via the same remote-execution + output-capture channel,
+  parsed into a readable per-event table; complements `--wts`, which
+  only reports *current* session state, not past logoffs
 - Flexible output: append mode with timestamps, simultaneous sort-by-IP
   and sort-by-port result files
 
@@ -85,8 +90,11 @@ prompt, just an .exe you can drop anywhere.
 ## TODO
 
 See the TODO section at the end of [HELP.txt](HELP.txt) — remaining items
-are a GUI on top of the console core, WinRM as an alternative WMI/WTS
-transport, and mining the Security event log for logoff time.
+are a GUI on top of the console core and WinRM as an alternative WMI/WTS
+transport (postponed: mingw-w64's `wsman.h` is missing the client
+invoke/shell/get functions and the `wsmsvc` library entirely — hand-rolling
+that ABI with no real Windows machine to validate against was judged too
+risky for now).
 
 ## License
 

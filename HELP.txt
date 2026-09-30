@@ -495,10 +495,11 @@ don't administer.
         answer, same spirit as the TTL-based OS guess elsewhere in this
         tool. Logoff time is NOT available the same way: WMI only
         exposes currently-active sessions, so there's nothing to query
-        once a session has ended - a real logoff time would need to be
-        mined from the Security event log (Win32_NTLogEvent, event ID
-        4634/4647), which requires the Security log to be remotely
-        readable and its auditing enabled - not implemented yet.
+        once a session has ended - see --logoff-time further below,
+        which mines the Security event log (Win32_NTLogEvent, event IDs
+        4634/4647/4778/4779) via --remote-exec instead - this requires
+        the Security log to be remotely readable and its relevant
+        auditing enabled on the target, same caveat as before.
 
     Before attempting the (potentially slow) DCOM connection, the
     scanner first does its own quick TCP check against port 135 (the
@@ -632,6 +633,21 @@ don't administer.
        ephemeral port, which many networks permit even when
        inter-workstation SMB is locked down.
 
+       Note: this opens a listening port on the SCANNING machine
+       itself, briefly (only while a --remote-exec-output run is in
+       flight). Whether that's silent or not depends entirely on the
+       firewall configuration of the machine RUNNING netscan - the
+       tool has no control over this either way: on a domain-joined
+       machine with a GPO-managed firewall profile, traffic is
+       typically allowed or blocked according to policy with no
+       prompt at all; on an interactively-managed Windows machine
+       (e.g. a sysadmin's own desktop/laptop), Windows Defender
+       Firewall may show its standard "allow this app" prompt the
+       first time such a port is opened. Neither netscan nor this
+       document can pre-answer that prompt - only a local admin (via
+       Windows Firewall settings or `netsh advfirewall firewall add
+       rule ...` ahead of time) or a GPO firewall rule can.
+
     2. ADMIN$ share read (fallback). If nothing was received via the
        push step within its window, the scanner falls back to reading
        the same file directly from \\<target>\ADMIN$\Temp\ns_<uuid>.out
@@ -685,6 +701,76 @@ don't administer.
     takes priority. --remote-exec-output has no effect combined with
     --enable-discovery - the canned script's own output was never
     meant to be inspected, only its success/failure.
+
+--logoff-time
+    A second canned --remote-exec script - not about *current* session
+    state (that's --wts: idle time, logon time, connected/disconnected
+    right now), but about *history*: when accounts actually logged off
+    or an RDP session disconnected, mined from the target's own Security
+    event log. Automatically implies output capture the same way
+    --remote-exec-output does - a --logoff-time run with no captured
+    output would be pointless, so there's no need to also pass
+    --remote-exec-output separately (harmless if you do).
+
+    Runs (via the same SYSTEM-principal Task Scheduler mechanism as
+    --remote-exec/--enable-discovery, so it needs no rights beyond
+    those already documented above):
+
+        Get-WinEvent -FilterHashtable @{LogName='Security';
+            Id=4634,4647,4778,4779} -MaxEvents N -ErrorAction
+            SilentlyContinue | ForEach-Object { ...extract account name
+            from $_.Message via regex...; '{time}|{id}|{user}' }
+
+    The four event IDs:
+      4634  An account was logged off
+      4647  User initiated logoff (a cleaner voluntary logoff, usually
+            paired with a 4634 moments later for the same session)
+      4778  A session was reconnected to a Terminal Server (RDP)
+      4779  A session was disconnected from a Terminal Server (RDP) -
+            this is specifically the "дисконнект" event: the session
+            is still technically alive, just not actively connected,
+            which is exactly the state --wts's own "disconnected
+            session" reporting is about in real time; --logoff-time
+            gives you the history of when that happened, not just
+            the current state.
+
+    The account name isn't taken from the event's structured property
+    array (whose index differs per event ID - a genuinely different
+    schema for each of these four IDs), but instead regex-extracted
+    from the rendered $_.Message text ("Account Name:\s*(\S+)") - one
+    pattern works uniformly across all four IDs this way, at the cost
+    of depending on the message template's English wording, which is
+    NOT localized (Windows renders event Message text in English by
+    default regardless of the system's display language - only
+    DisplayGroup/category names get localized, as already noted under
+    --enable-discovery above) - so this isn't expected to break on a
+    Russian-language Windows target either.
+
+    Output is parsed back into a readable table - one line per event,
+    "<timestamp>  <human label>  <account>" - by netscan itself (NOT
+    left as the raw "time|id|user" text that's actually transferred).
+    An unparseable line (no two "|" separators found - most likely a
+    PowerShell error message, e.g. if Get-WinEvent itself isn't
+    available or the Security log isn't readable) is printed as-is
+    rather than dropped, so a real failure is still visible instead of
+    silently producing an empty-looking result.
+
+    --logoff-time-count N (default 20, range 1-500)
+        How many of the most recent matching events to pull (across
+        all four IDs combined, newest first - Get-WinEvent's default
+        ordering). Raising this doesn't materially change performance
+        on the target (event log queries are fast even for a few
+        hundred events) but does make the captured text longer - see
+        --remote-exec-output-size above if truncation becomes an issue
+        with a large --logoff-time-count.
+
+    Requires PowerShell 3.0+ on the target for the -FilterHashtable
+    parameter syntax used here (ships by default on Windows 8/Server
+    2012 and later; on Windows 7/Vista this needs the Windows
+    Management Framework 3.0+ update installed - if it's missing,
+    PowerShell itself will error out on the unrecognized parameter,
+    which gets captured as unparseable text and shown as-is per the
+    paragraph above, rather than silently producing nothing).
 
 --wsd
     Turns on --info automatically. Queries WS-Discovery (UDP 3702) -
@@ -762,6 +848,8 @@ don't administer.
           WTS idle: N.N min.
           Remote-exec: done, exit code N     (only with --remote-exec/--enable-discovery)
           Remote-exec output: ...            (only with --remote-exec-output; multi-line block)
+          История логоффов/дисконнектов: ... (only with --logoff-time; multi-line block, replaces
+                                               the "Remote-exec:" line above entirely for this run)
         ******************************************************************
         ip
           ...
@@ -868,9 +956,13 @@ Discussed but NOT YET IMPLEMENTED:
   [x] Approximate interactive logon time via WMI (Win32_LogonSession).
         DONE, with the caveat above about multiple sessions.
 
-  [ ] Logoff time - needs Security event log mining (Win32_NTLogEvent,
-        event ID 4634/4647) rather than a simple WMI class query; not
-        yet implemented.
+  [x] Logoff time - needs Security event log mining (Win32_NTLogEvent,
+        event ID 4634/4647) rather than a simple WMI class query. DONE -
+        see --logoff-time below (implemented via --remote-exec rather
+        than a new WMI/DCOM code path - a Get-WinEvent one-liner run
+        through the already-working Task Scheduler + output-capture
+        machinery, avoiding a whole new event-log query implementation
+        in C).
 
   [x] Idle time, logon time, and current session user via the Terminal
         Services API (--wts): WTSOpenServer + WTSQuerySessionInformation
@@ -885,12 +977,11 @@ Discussed but NOT YET IMPLEMENTED:
         available) - see HELP-tests.txt for the real-world validation
         checklist.
 
-  [ ] Logoff time specifically (as opposed to logon time/idle time,
-        both now covered by --wts above) still isn't directly queryable
-        - WTS only reports currently active/disconnected sessions, not
-        a history of past logoffs. Would still need Security event log
-        mining (Win32_NTLogEvent, event ID 4634/4647) for that specific
-        piece.
+  [x] Logoff time specifically (as opposed to logon time/idle time,
+        both now covered by --wts above) is now directly queryable via
+        --logoff-time - see its full entry above (Security event log
+        mining, events 4634/4647/4778/4779, via --remote-exec rather
+        than a new WMI/DCOM code path).
 
   [x] Task Scheduler (ITaskService, COM/DCOM, taskschd.h) as a general
         "run something once on the target and collect the result"
