@@ -243,6 +243,41 @@ FULL FEATURE REFERENCE
     cmd.exe window, not when output is redirected to a file/pipe). To
     force the old sequential order, see --sequential.
 
+    The progress line updates in place using two complementary
+    mechanisms, not a bare carriage return alone:
+
+    1. Its width adapts to the actual console window width (queried
+       via GetConsoleScreenBufferInfo, re-checked on every update)
+       rather than a fixed 30-character bar - older systems with the
+       legacy console host (observed on Server 2012; likely also
+       Windows 7/8 and early Server 2012 R2) default to an 80-column
+       window, and the un-adapted line used to be exactly 80
+       characters wide, which filled the last column and made the
+       console auto-wrap to a new row. Windows 10/Server 2016+'s
+       default console is wider, which is why this specific trigger
+       never showed up there. Below a sane minimum the bar bottoms out
+       at 5 characters, and if the console is narrower than even the
+       non-bar part of the line, the whole line is hard-truncated to
+       fit, safely at a UTF-8 character boundary (never splits
+       "найдено"'s Cyrillic bytes mid-character). The line is also
+       right-padded with spaces to exactly fill its target width, so a
+       shorter later render can't leave stray trailing characters from
+       a longer earlier one.
+
+    2. Each update explicitly repositions the cursor to the row it
+       started on (SetConsoleCursorPosition) before writing, rather
+       than relying on a carriage return to land back on "the same
+       row" - an assumption that silently breaks if the cursor ends up
+       on a different row for ANY reason, width-overflow being only
+       the most common one. This is the same mechanism already used
+       for the two simultaneous bars described above, now applied to
+       the single-bar case too: on the first update, the console's
+       current cursor row is captured once and reused for every later
+       update of that same bar. Falls back to a plain carriage-return
+       prefix only if GetConsoleScreenBufferInfo itself fails (output
+       isn't a real console - redirected to a file or pipe), where
+       positioning would be meaningless anyway.
+
 --include-reserved
     Do not skip x.x.x.0 and x.x.x.255 - scan them like ordinary hosts.
     Only needed with a non-standard subnet mask where these addresses

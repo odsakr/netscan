@@ -759,11 +759,65 @@ mDNS/LLMNR in section 7.
       (relevant if Windows Defender/SmartScreen adds its own delay
       before the process even starts running).
 
+14.2  Progress bar overwrites in place, doesn't scroll (the Server 2012
+      regression this was specifically fixed for)
+
+      On a Windows 7/Server 2012(-R2) machine, or any system using the
+      legacy console host - or really any Windows machine at all, this
+      should now hold everywhere - open cmd.exe normally (don't resize
+      it first) and run:
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 1-1000
+                      --proto tcp --mode full --threads 10
+
+      Expect: ONE progress line that updates itself in place
+      (percentage/counters climbing on the same screen row), never a
+      scrolling series of near-identical lines stacking up one after
+      another - compare to how `wget`'s download progress behaves, not
+      a classic unix `yes`-style flood of lines. If the scrolling comes
+      back, check the actual window width first (`mode con` at the
+      same cmd prompt shows "Columns") - the bar adapts to whatever
+      width GetConsoleScreenBufferInfo reports, so a genuinely
+      different failure mode (not just "window happens to be narrow")
+      would point at something else, e.g. the console host not
+      reporting a usable window size at all (some non-standard
+      terminal emulators/SSH-to-Windows setups), or the cursor-
+      positioning calls themselves failing for a reason specific to
+      that environment.
+
+      Cross-check 1: resize the SAME window wider mid-run (drag the
+      window edge, or `mode con cols=150`) - the bar should visibly
+      grow thicker (more "#"/"-" characters) within a couple of
+      progress updates, since the width is re-checked on every update
+      rather than cached once at startup.
+
+      Cross-check 2: run with --proto all on the same machine - expect
+      TWO separate progress lines (one per protocol), each updating in
+      place independently, neither one ever scrolling or bleeding into
+      the other's row.
+
 
 ================================================================================
 NOTES FOR WHOEVER RUNS THIS
 ================================================================================
 
+- Test 14.2 (progress bar) is unusual among the notes below in that it
+  was validated more thoroughly than most: the width-fitting algorithm
+  itself was run as a standalone native test program across console
+  widths from 10 to 120 columns with no rendering ever exceeding the
+  target width or corrupting the "найдено:" Cyrillic text. More
+  importantly, the actual Win32 console mechanism (GetConsoleScreenBufferInfo
+  + SetConsoleCursorPosition) was exercised under Wine with a REAL pty
+  attached (via the `script` utility - piping output through a plain
+  pipe, as in most of this project's other Wine smoke tests, only ever
+  exercises the non-console fallback branch and never touches the real
+  positioning code at all, which is easy to miss). With a real pty,
+  confirmed that a single-bar scan produces exactly one real terminal
+  line across many progress updates, and a --proto all dual-bar scan
+  produces exactly two, matching the fix's intent. What's still NOT
+  validated is the real Server 2012 legacy console host itself - Wine's
+  own console implementation is a separate thing, not Server 2012's -
+  so test 14.2 above is specifically about closing that last gap.
 - Tests in sections 7-12 (--info / --deep-resolve / --wmi / --wts /
   --remote-exec / --enable-discovery / --wsd) were built and unit-tested
   against simulated protocol responses during development (hand-crafted
