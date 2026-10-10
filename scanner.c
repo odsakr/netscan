@@ -81,8 +81,22 @@ typedef struct {
     uint64_t total;
     const char *name;
     int is_tcp;        /* актуально для TCP/UDP фаз, для PING игнорируется */
-    int console_line;  /* -1 = обычный однострочный режим (перезапись через \r);
+    int console_line;  /* -1 = обычный однострочный режим;
                            >=0 = фиксированная строка в консоли (для параллельного TCP+UDP) */
+    int origin_row_captured; /* только для console_line == -1: 1, если origin_row
+                                 уже захвачен (см. print_progress) */
+    int origin_row;          /* строка консоли, захваченная при первом вызове
+                                 print_progress - все обновления этого бара
+                                 потом ЯВНО позиционируются именно туда, а не
+                                 полагаются на то, что \r вернёт курсор в
+                                 начало ТОЙ ЖЕ строки (это предположение не
+                                 держится, если предыдущая запись случайно
+                                 перенеслась на новую строку - неважно,
+                                 почему: неверно посчитанная ширина, чужой
+                                 вывод в консоль между вызовами, что угодно -
+                                 явная перепозиция иммунна к этому классу
+                                 багов целиком, а не просто устраняет один
+                                 конкретный его источник). */
 } ScanState;
 
 static int g_console_base_y = -1; /* строка консоли, с которой начинаются "закреплённые" строки прогресса */
@@ -679,39 +693,167 @@ static const char *guess_device_by_ports(uint32_t ip) {
 /* Прогресс-бар                                                           */
 /* ---------------------------------------------------------------------- */
 
+/* Видимая ширина UTF-8 строки в столбцах консоли (не в байтах) - строка
+   прогресса содержит "найдено:" кириллицей (2 байта на символ в UTF-8),
+   так что обычный strlen() завысил бы ширину. Считает кодовые точки
+   (байты, не являющиеся continuation-байтами 10xxxxxx) - этого
+   достаточно для всех символов, которые реально встречаются в этой
+   строке (ни одного full-width/комбинирующего символа тут нет). */
+static int utf8_display_width(const char *s) {
+    int w = 0;
+    for (; *s; s++) {
+        if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    }
+    return w;
+}
+
+/* Жёсткое обрезание строки до N видимых столбцов, по границе UTF-8-
+   символа (никогда не режет многобайтовую последовательность пополам -
+   иначе на выходе будут невалидные байты и консоль покажет "кракозябры"
+   вместо аккуратного обрезания). Последний рубеж защиты на совсем узких
+   консолях, где даже минимальной ширины бара уже недостаточно. */
+static void utf8_truncate_to_width(char *s, int max_w) {
+    int w = 0;
+    char *p = s;
+    while (*p) {
+        unsigned char c = (unsigned char)*p;
+        int seqlen = 1;
+        if ((c & 0x80) == 0x00) seqlen = 1;
+        else if ((c & 0xE0) == 0xC0) seqlen = 2;
+        else if ((c & 0xF0) == 0xE0) seqlen = 3;
+        else if ((c & 0xF8) == 0xF0) seqlen = 4;
+        if (w + 1 > max_w) break;
+        w++;
+        p += seqlen;
+    }
+    *p = 0;
+}
+
+/* Реальная ширина окна консоли в столбцах - НЕ ширина буфера прокрутки
+   (которая на некоторых системах шире окна), а именно видимая область,
+   за которую отвечает перенос строки. Возвращает запасной вариант 80
+   (классический дефолт cmd.exe), если хэндл - не настоящая консоль
+   (вывод перенаправлен в файл/пайп) или запрос не удался. */
+static int get_console_width(void) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &csbi)) {
+        int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+        if (w > 0) return w;
+    }
+    return 80;
+}
+
 static void print_progress(ScanState *st) {
     EnterCriticalSection(&g_console_cs);
     LONG64 done = st->completed;
     uint64_t total = st->total ? st->total : 1;
     double pct = 100.0 * (double)done / (double)total;
     if (pct > 100.0) pct = 100.0;
-    int barw = 30;
-    int filled = (int)(pct / 100.0 * barw);
-    char bar[64];
-    int i = 0;
-    for (; i < filled && i < barw; i++) bar[i] = '#';
-    for (; i < barw; i++) bar[i] = '-';
-    bar[barw] = 0;
 
+    /* Ширина бара подстраивается под реальную ширину консоли - фикс для
+       Server 2012 и прочих систем со старой legacy-консолью, где окно
+       cmd.exe по умолчанию ровно 80 столбцов (на Windows 10/Server 2016+
+       обычно шире): если строка ровно заполняет последний столбец,
+       курсор переносится на следующую строку САМ. Оставляем минимум 1
+       столбец запаса (max_w = ширина - 1), чтобы никогда не писать ровно
+       в последний столбец. */
+    int max_w = get_console_width() - 1;
+    if (max_w < 20) max_w = 20; /* совсем узкая консоль - не уходим в абсурд */
+
+    int barw = 30;
+    char bar[64];
     char line[256];
-    snprintf(line, sizeof(line), "[%s] [%s] %5.1f%%  %10llu/%-10llu  найдено:%-6lld",
-             st->name, bar, pct,
-             (unsigned long long)done, (unsigned long long)total,
-             (long long)st->found);
+    for (;;) {
+        int filled = (int)(pct / 100.0 * barw);
+        int i = 0;
+        for (; i < filled && i < barw; i++) bar[i] = '#';
+        for (; i < barw; i++) bar[i] = '-';
+        bar[barw] = 0;
+
+        snprintf(line, sizeof(line), "[%s] [%s] %5.1f%%  %10llu/%-10llu  найдено:%-6lld",
+                 st->name, bar, pct,
+                 (unsigned long long)done, (unsigned long long)total,
+                 (long long)st->found);
+
+        int dw = utf8_display_width(line);
+        if (dw <= max_w || barw <= 5) break;
+        int shrink = dw - max_w;
+        barw -= shrink > 0 ? shrink : 1;
+        if (barw < 5) barw = 5;
+    }
+    /* На совсем узких консолях даже barw=5 может не влезть (сама
+       "обвязка" строки - проценты, счётчики, "найдено:" - уже шире
+       консоли) - дожимаем жёстким обрезанием как последний рубеж. */
+    if (utf8_display_width(line) > max_w) {
+        utf8_truncate_to_width(line, max_w);
+    }
+    /* Дополняем пробелами до фиксированной ширины max_w - иначе если
+       СЛЕДУЮЩИЙ рендер окажется короче предыдущего (редко, но возможно),
+       от старого более длинного кадра останется "хвост" справа. */
+    {
+        int cur_w = utf8_display_width(line);
+        if (cur_w < max_w) {
+            int pad = max_w - cur_w;
+            size_t len = strlen(line);
+            if (len + (size_t)pad < sizeof(line)) {
+                memset(line + len, ' ', (size_t)pad);
+                line[len + pad] = 0;
+            }
+        }
+    }
+
+    /* Абсолютное позиционирование курсора вместо расчёта на то, что \r
+       вернёт его в начало ТОЙ ЖЕ строки. Это предположение ломается не
+       только от переполнения ширины (уже обработано выше) - достаточно
+       ЛЮБОЙ причины, по которой предыдущая запись сдвинула курсор на
+       новую строку, и однострочная перезапись через \r рассыпается в
+       лесенку новых строк - ровно то, что сообщил Odsakr на Server 2012.
+       Явное SetConsoleCursorPosition на КАЖДОЙ отрисовке иммунно к этому
+       целым классом, а не просто убирает один конкретный источник. */
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    int positioned = 0;
+    COORD pos = {0, 0};
 
     if (st->console_line >= 0 && g_console_base_y >= 0) {
-        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-        COORD pos;
         pos.X = 0;
         pos.Y = (SHORT)(g_console_base_y + st->console_line);
+        positioned = 1;
+    } else if (st->console_line < 0) {
+        if (!st->origin_row_captured) {
+            CONSOLE_SCREEN_BUFFER_INFO csbi;
+            if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &csbi)) {
+                st->origin_row = csbi.dwCursorPosition.Y;
+                st->origin_row_captured = 1;
+            }
+        }
+        if (st->origin_row_captured) {
+            pos.X = 0;
+            pos.Y = (SHORT)st->origin_row;
+            positioned = 1;
+        }
+    }
+
+    if (positioned) {
         SetConsoleCursorPosition(h, pos);
         conprintf("%s", line);
         fflush(stdout);
-        COORD safe;
-        safe.X = 0;
-        safe.Y = (SHORT)(g_console_base_y + 2);
-        SetConsoleCursorPosition(h, safe);
+        if (st->console_line >= 0) {
+            /* держим курсор НИЖЕ всех закреплённых строк, чтобы
+               случайный посторонний вывод не влез между ними */
+            COORD safe;
+            safe.X = 0;
+            safe.Y = (SHORT)(g_console_base_y + 2);
+            SetConsoleCursorPosition(h, safe);
+        } else {
+            /* возвращаем курсор на начало ЭТОЙ ЖЕ строки - детерминированное
+               состояние для следующего вызова */
+            SetConsoleCursorPosition(h, pos);
+        }
     } else {
+        /* Не настоящая консоль (вывод перенаправлен в файл/пайп) -
+           GetConsoleScreenBufferInfo принципиально не может сработать;
+           \r просто попадёт в файл как обычный байт, как и раньше. */
         conprintf("\r%s", line);
         fflush(stdout);
     }
