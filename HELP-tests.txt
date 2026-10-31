@@ -796,28 +796,78 @@ mDNS/LLMNR in section 7.
       place independently, neither one ever scrolling or bleeding into
       the other's row.
 
+14.3  Single bar stays VISIBLE when other output happens alongside it
+      (regression test for a second Server 2012 bug this fix introduced
+      and then had to back out of - see the NOTES entry below for the
+      full story)
+
+      netscan_x64.exe --ip 192.168.1.1-192.168.1.254 --ports 3389
+                      --proto all --discover --threads 100 --info
+                      --deep-resolve --mode full --out result.txt
+
+      This specifically needs --discover (so a "Разведка (ICMP+ARP):
+      живых N из M" line prints right after the ping phase),
+      --info/--deep-resolve (so per-host detail blocks print during the
+      later info-gathering phase), and a console window short enough
+      (or a big enough IP range) that the window actually scrolls at
+      some point during the run - a maximized window on a huge range is
+      the easiest way to guarantee this.
+
+      Expect: the active progress bar is ALWAYS visible somewhere on
+      screen, continuously updating, for every phase that has one (the
+      initial --discover ping sweep, then the TCP+UDP port scan). It
+      should never go to a blank/unchanging screen while the process is
+      still clearly working (CPU usage in Task Manager/System Informer
+      stays nonzero, the result file eventually appears) - that
+      specific combination (program is doing real work, confirmed by
+      CPU use, but the console shows nothing changing) is exactly the
+      symptom of the bug this test guards against.
+
 
 ================================================================================
 NOTES FOR WHOEVER RUNS THIS
 ================================================================================
 
-- Test 14.2 (progress bar) is unusual among the notes below in that it
-  was validated more thoroughly than most: the width-fitting algorithm
-  itself was run as a standalone native test program across console
-  widths from 10 to 120 columns with no rendering ever exceeding the
-  target width or corrupting the "найдено:" Cyrillic text. More
-  importantly, the actual Win32 console mechanism (GetConsoleScreenBufferInfo
-  + SetConsoleCursorPosition) was exercised under Wine with a REAL pty
-  attached (via the `script` utility - piping output through a plain
-  pipe, as in most of this project's other Wine smoke tests, only ever
-  exercises the non-console fallback branch and never touches the real
-  positioning code at all, which is easy to miss). With a real pty,
-  confirmed that a single-bar scan produces exactly one real terminal
-  line across many progress updates, and a --proto all dual-bar scan
-  produces exactly two, matching the fix's intent. What's still NOT
-  validated is the real Server 2012 legacy console host itself - Wine's
-  own console implementation is a separate thing, not Server 2012's -
-  so test 14.2 above is specifically about closing that last gap.
+- The progress bar (tests 14.2-14.3) has a genuinely instructive history
+  worth knowing before touching it again. First pass: the bar's width
+  was made to adapt to the real console width (fixing the original
+  Server 2012 scrolling report), confirmed via a standalone native test
+  program across console widths 10-120 and a Wine+real-pty smoke test -
+  both looked clean, and HELP-tests.txt said so at the time. It then
+  turned out the ORIGINAL hang Odsakr reported was never actually in
+  this code at all - it was a `chcp 65001`-vs-UAC-elevation race in his
+  own wrapper batch script, nothing to do with netscan - found only
+  after a full 7-way git-history bisection (every single build was
+  innocent) plus a live A/B test of the official GitHub Actions build
+  against a locally-built one (both hung identically, which ruled out
+  a build-toolchain difference too). So the width-adaptation fix was
+  real and worth keeping, but was solving a problem that, in hindsight,
+  turned out not to be the one that actually mattered that day.
+  Separately, an extra layer added during that same pass - explicit
+  SetConsoleCursorPosition on every single-bar update, locking to a row
+  captured once at the start, instead of a plain carriage return - was
+  NOT solving a real problem and introduced a new one: if anything else
+  printed below the bar while it was still running (a found-host line,
+  --info/--deep-resolve output), the console window would scroll, the
+  captured row would scroll along with it out of the visible area, and
+  the bar would keep updating correctly but invisibly - CPU usage
+  nonzero, result file eventually appears, screen shows nothing
+  changing. This one WAS confirmed on real Server 2012 hardware (by
+  Odsakr, running the exact --discover --info --deep-resolve --proto
+  all combination that reliably scrolls the window) before being
+  reverted back to a plain carriage return for the single-bar case
+  specifically - see HELP.txt's --proto all entry for the full
+  explanation of why carriage-return doesn't have this problem but
+  absolute positioning does. The two simultaneous --proto all bars
+  still use absolute positioning (genuinely required there, and hasn't
+  shown this problem in practice) - tests 14.2's cross-check 2 and 14.3
+  both touch on this, worth rerunning if this code changes again.
+  Lesson for later: Wine testing (even with a real pty) and a
+  standalone width-fitting test both came back clean for the
+  now-reverted mechanism - neither one naturally exercises "something
+  else prints while the bar is mid-update, on a window short enough to
+  scroll", which is exactly the condition that triggered this. A smoke
+  test that looks clean only proves the specific thing it checked.
 - Tests in sections 7-12 (--info / --deep-resolve / --wmi / --wts /
   --remote-exec / --enable-discovery / --wsd) were built and unit-tested
   against simulated protocol responses during development (hand-crafted
